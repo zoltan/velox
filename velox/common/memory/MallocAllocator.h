@@ -85,6 +85,38 @@ class MallocAllocator : public MemoryAllocator {
 
   std::string toString() const override;
 
+ protected:
+  // Return false to allocate each size-class block separately. Bounded pools
+  // can then satisfy noncontiguous requests from disjoint free blocks instead
+  // of requiring a larger contiguous backing allocation. The default combines
+  // blocks within each size class to reduce calls to the backing allocator.
+  virtual bool coalesceNonContiguousRuns() const {
+    return true;
+  }
+
+  // Raw allocation hooks. The default implementations use libc
+  // (malloc/aligned_alloc/calloc/realloc/free); a subclass (e.g. a pinned-host
+  // allocator) overrides these to change the backing memory while
+  // inheriting all of MallocAllocator's Allocation/PageRun bookkeeping,
+  // capacity accounting, partial-allocation rollback, failure messages and
+  // stats -- so the malloc and the alternate-backing implementations cannot
+  // drift. `rawFree` takes the byte size so a size-tracking backend (a memory
+  // pool) can deallocate correctly; libc free ignores it.
+  virtual void* rawAllocate(size_t bytes, uint16_t alignment);
+  virtual void* rawAllocateZeroFilled(size_t bytes);
+  virtual void rawFree(void* ptr, size_t bytes) noexcept;
+  virtual void*
+  rawReallocate(void* p, size_t oldSize, size_t newSize, uint16_t alignment);
+
+  // Allocates 'maxBytes' of contiguous memory using malloc or mmap depending
+  // on 'mallocContiguousEnabled_'. Returns the allocated pointer, or nullptr
+  // on failure. Virtual so a subclass can back it with its own memory.
+  virtual void* dispatchAllocateContiguous(size_t maxBytes);
+
+  // Frees contiguous memory previously allocated by
+  // dispatchAllocateContiguous.
+  virtual void dispatchFreeContiguous(ContiguousAllocation& allocation);
+
  private:
   bool allocateNonContiguousWithoutRetry(
       const SizeMix& sizeMix,
@@ -101,15 +133,6 @@ class MallocAllocator : public MemoryAllocator {
       Allocation* collateral,
       ContiguousAllocation& allocation,
       MachinePageCount maxPages);
-
-  // Allocates 'maxBytes' of contiguous memory using malloc or mmap depending
-  // on 'mallocContiguousEnabled_'. Returns the allocated pointer, or nullptr
-  // on failure.
-  void* dispatchAllocateContiguous(size_t maxBytes);
-
-  // Frees contiguous memory previously allocated by
-  // dispatchAllocateContiguous.
-  void dispatchFreeContiguous(ContiguousAllocation& allocation);
 
   void freeContiguousImpl(ContiguousAllocation& allocation);
 

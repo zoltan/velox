@@ -26,6 +26,7 @@ add_executable(
   CustomMemoryRegistrationTest.cpp
   DynamicMmapAllocatorTest.cpp
   HashStringAllocatorTest.cpp
+  MallocAllocatorTest.cpp
   MemoryAllocatorTest.cpp
   MemoryArbitratorTest.cpp
   MemoryCapExceededTest.cpp

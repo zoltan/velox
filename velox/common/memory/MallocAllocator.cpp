@@ -19,6 +19,7 @@
 #include "velox/common/memory/Memory.h"
 
 #include <sys/mman.h>
+#include <numeric>
 
 namespace facebook::velox::memory {
 MallocAllocator::MallocAllocator(const Options& options)
@@ -69,42 +70,49 @@ bool MallocAllocator::allocateNonContiguousWithoutRetry(
     return false;
   }
 
-  std::vector<void*> buffers;
-  buffers.reserve(sizeMix.numSizes);
-  for (int32_t i = 0; i < sizeMix.numSizes; ++i) {
-    MachinePageCount numSizeClassPages =
-        sizeMix.sizeCounts[i] * sizeClassSizes_[sizeMix.sizeIndices[i]];
-    void* ptr = nullptr;
-    // Trigger allocation failure by skipping malloc
-    if (!testingHasInjectedFailure(InjectedFailure::kAllocate)) {
-      stats_.recordAllocate(
-          AllocationTraits::pageBytes(sizeClassSizes_[sizeMix.sizeIndices[i]]),
-          sizeMix.sizeCounts[i],
-          [&]() {
-            ptr = ::malloc(
-                AllocationTraits::pageBytes(numSizeClassPages)); // NOLINT
-          });
+  std::vector<std::pair<void*, size_t>> buffers;
+  const bool coalesce = coalesceNonContiguousRuns();
+  const auto numRuns = coalesce
+      ? sizeMix.numSizes
+      : std::accumulate(
+            sizeMix.sizeCounts.begin(), sizeMix.sizeCounts.end(), 0);
+  buffers.reserve(numRuns);
+  bool success = true;
+  for (int32_t i = 0; i < sizeMix.numSizes && success; ++i) {
+    const auto classPages = sizeClassSizes_[sizeMix.sizeIndices[i]];
+    const auto countPerRun = coalesce ? sizeMix.sizeCounts[i] : 1;
+    const auto runPages = countPerRun * classPages;
+    const auto runBytes = AllocationTraits::pageBytes(runPages);
+    for (int32_t count = 0; count < sizeMix.sizeCounts[i];
+         count += countPerRun) {
+      void* ptr = nullptr;
+      // Trigger allocation failure by skipping the raw allocation.
+      if (!testingHasInjectedFailure(InjectedFailure::kAllocate)) {
+        stats_.recordAllocate(
+            AllocationTraits::pageBytes(classPages), countPerRun, [&]() {
+              ptr = rawAllocate(runBytes, kMinAlignment);
+            });
+      }
+      if (ptr == nullptr) {
+        const auto errorMsg = fmt::format(
+            "Malloc failed to allocate {} of memory while allocating for "
+            "non-contiguous allocation of {} pages",
+            succinctBytes(runBytes),
+            sizeMix.totalPages);
+        VELOX_MEM_LOG(WARNING) << errorMsg;
+        setAllocatorFailureMessage(errorMsg);
+        success = false;
+        break;
+      }
+      buffers.push_back({ptr, runBytes});
+      out.append(reinterpret_cast<uint8_t*>(ptr), runPages); // NOLINT
     }
-    if (ptr == nullptr) {
-      // Failed to allocate memory from memory.
-      const auto errorMsg = fmt::format(
-          "Malloc failed to allocate {} of memory while allocating for "
-          "non-contiguous allocation of {} pages",
-          succinctBytes(AllocationTraits::pageBytes(numSizeClassPages)),
-          sizeMix.totalPages);
-      VELOX_MEM_LOG(WARNING) << errorMsg;
-      setAllocatorFailureMessage(errorMsg);
-      break;
-    }
-    buffers.push_back(ptr);
-    out.append(reinterpret_cast<uint8_t*>(ptr), numSizeClassPages); // NOLINT
   }
 
-  if (buffers.size() != sizeMix.numSizes) {
-    // Failed to allocate memory using malloc. Free any malloced pages and
-    // return false.
-    for (auto* buffer : buffers) {
-      ::free(buffer);
+  if (!success) {
+    // Failed to allocate. Free any allocated runs and return false.
+    for (auto& [buffer, runBytes] : buffers) {
+      rawFree(buffer, runBytes);
     }
     out.clear();
     VELOX_MEM_LOG(WARNING)
@@ -203,7 +211,7 @@ int64_t MallocAllocator::freeNonContiguous(Allocation& allocation) {
     const int64_t numPages = run.numPages();
     freedPages += numPages;
     stats_.recordFree(AllocationTraits::pageBytes(numPages), [&]() {
-      ::free(ptr); // NOLINT
+      rawFree(ptr, AllocationTraits::pageBytes(numPages)); // NOLINT
     });
   }
 
@@ -307,8 +315,7 @@ void* MallocAllocator::allocateBytesWithoutRetry(
         bytes,
         alignment);
   }
-  void* result = (alignment > kMinAlignment) ? ::aligned_alloc(alignment, bytes)
-                                             : ::malloc(bytes);
+  void* result = rawAllocate(bytes, alignment);
   if (FOLLY_UNLIKELY(result == nullptr)) {
     VELOX_MEM_LOG(ERROR) << "Failed to allocateBytes " << succinctBytes(bytes)
                          << " with " << alignment << " alignment";
@@ -327,7 +334,7 @@ void* MallocAllocator::allocateZeroFilledWithoutRetry(uint64_t bytes) {
     setAllocatorFailureMessage(errorMsg);
     return nullptr;
   }
-  void* result = std::calloc(1, bytes);
+  void* result = rawAllocateZeroFilled(bytes);
   if (FOLLY_UNLIKELY(result == nullptr)) {
     VELOX_MEM_LOG(ERROR) << "Failed to allocateZeroFilled "
                          << succinctBytes(bytes);
@@ -363,7 +370,7 @@ void* MallocAllocator::reallocateBytesWithoutRetry(
     setAllocatorFailureMessage(errorMsg);
     return nullptr;
   }
-  void* result = ::realloc(p, newSize); // NOLINT
+  void* result = rawReallocate(p, oldSize, newSize, alignment);
   if (result == nullptr) {
     // realloc failed. The original pointer is still valid.
     if (delta > 0) {
@@ -391,8 +398,33 @@ void* MallocAllocator::reallocateBytesWithoutRetry(
 }
 
 void MallocAllocator::freeBytes(void* p, uint64_t bytes) noexcept {
-  ::free(p); // NOLINT
+  rawFree(p, bytes); // NOLINT
   decrementUsage(bytes);
+}
+
+// ---- Default raw-allocation hooks (libc). A subclass overrides these to
+// change
+// ---- the backing memory; MallocAllocator's behavior is unchanged because the
+// ---- defaults are exactly the calls the bookkeeping above used before.
+void* MallocAllocator::rawAllocate(size_t bytes, uint16_t alignment) {
+  return (alignment > kMinAlignment) ? ::aligned_alloc(alignment, bytes)
+                                     : ::malloc(bytes); // NOLINT
+}
+
+void* MallocAllocator::rawAllocateZeroFilled(size_t bytes) {
+  return std::calloc(1, bytes); // NOLINT
+}
+
+void MallocAllocator::rawFree(void* ptr, size_t /*bytes*/) noexcept {
+  ::free(ptr); // NOLINT
+}
+
+void* MallocAllocator::rawReallocate(
+    void* p,
+    size_t /*oldSize*/,
+    size_t newSize,
+    uint16_t /*alignment*/) {
+  return ::realloc(p, newSize); // NOLINT
 }
 
 bool MallocAllocator::checkConsistency() const {
