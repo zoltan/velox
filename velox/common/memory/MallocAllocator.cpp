@@ -72,40 +72,60 @@ bool MallocAllocator::allocateNonContiguousWithoutRetry(
 
   std::vector<std::pair<void*, size_t>> buffers;
   const bool coalesce = coalesceNonContiguousRuns();
+  const bool splitOnFailure = !coalesce && splitNonContiguousRunsOnFailure();
   const auto numRuns = coalesce
       ? sizeMix.numSizes
       : std::accumulate(
             sizeMix.sizeCounts.begin(), sizeMix.sizeCounts.end(), 0);
   buffers.reserve(numRuns);
+  auto allocateRun = [&](auto&& self,
+                         MachinePageCount runPages,
+                         MachinePageCount classPages,
+                         int32_t countPerRun) -> bool {
+    const auto runBytes = AllocationTraits::pageBytes(runPages);
+    void* ptr = nullptr;
+    const bool injectedFailure =
+        testingHasInjectedFailure(InjectedFailure::kAllocate);
+    if (!injectedFailure) {
+      stats_.recordAllocate(
+          AllocationTraits::pageBytes(classPages), countPerRun, [&]() {
+            ptr = rawAllocate(runBytes, kMinAlignment);
+          });
+    }
+    if (ptr != nullptr) {
+      buffers.emplace_back(ptr, runBytes);
+      out.append(reinterpret_cast<uint8_t*>(ptr), runPages); // NOLINT
+      return true;
+    }
+    const auto halfPages = runPages / 2;
+    if (!injectedFailure && splitOnFailure &&
+        halfPages >= sizeMix.minSizeClass) {
+      // Size classes are powers of two. Keep any successful smaller runs in
+      // the same rollback list as the original run, so partial subdivision
+      // failures retain the all-or-nothing allocation contract.
+      return self(self, halfPages, halfPages, 1) &&
+          self(self, halfPages, halfPages, 1);
+    }
+    const auto errorMsg = fmt::format(
+        "Malloc failed to allocate {} of memory while allocating for "
+        "non-contiguous allocation of {} pages",
+        succinctBytes(runBytes),
+        sizeMix.totalPages);
+    VELOX_MEM_LOG(WARNING) << errorMsg;
+    setAllocatorFailureMessage(errorMsg);
+    return false;
+  };
   bool success = true;
   for (int32_t i = 0; i < sizeMix.numSizes && success; ++i) {
     const auto classPages = sizeClassSizes_[sizeMix.sizeIndices[i]];
     const auto countPerRun = coalesce ? sizeMix.sizeCounts[i] : 1;
     const auto runPages = countPerRun * classPages;
-    const auto runBytes = AllocationTraits::pageBytes(runPages);
     for (int32_t count = 0; count < sizeMix.sizeCounts[i];
          count += countPerRun) {
-      void* ptr = nullptr;
-      // Trigger allocation failure by skipping the raw allocation.
-      if (!testingHasInjectedFailure(InjectedFailure::kAllocate)) {
-        stats_.recordAllocate(
-            AllocationTraits::pageBytes(classPages), countPerRun, [&]() {
-              ptr = rawAllocate(runBytes, kMinAlignment);
-            });
-      }
-      if (ptr == nullptr) {
-        const auto errorMsg = fmt::format(
-            "Malloc failed to allocate {} of memory while allocating for "
-            "non-contiguous allocation of {} pages",
-            succinctBytes(runBytes),
-            sizeMix.totalPages);
-        VELOX_MEM_LOG(WARNING) << errorMsg;
-        setAllocatorFailureMessage(errorMsg);
+      if (!allocateRun(allocateRun, runPages, classPages, countPerRun)) {
         success = false;
         break;
       }
-      buffers.push_back({ptr, runBytes});
-      out.append(reinterpret_cast<uint8_t*>(ptr), runPages); // NOLINT
     }
   }
 

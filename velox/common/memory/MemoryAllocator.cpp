@@ -98,6 +98,7 @@ MemoryAllocator::SizeMix MemoryAllocator::allocationSize(
       minSizeClass,
       sizeClassSizes_.back());
   MemoryAllocator::SizeMix mix;
+  mix.minSizeClass = std::max<MachinePageCount>(1, minSizeClass);
   int32_t neededPages = numPages;
   MachinePageCount pagesToAlloc{0};
   for (int32_t sizeIndex = sizeClassSizes_.size() - 1; sizeIndex >= 0;

@@ -94,6 +94,14 @@ class MallocAllocator : public MemoryAllocator {
     return true;
   }
 
+  // When runs are allocated separately, a bounded backing pool can reuse
+  // smaller free blocks if a size-class allocation fails. Subdivision never
+  // goes below the caller's minimum run size. Ordinary malloc does not need
+  // this fallback.
+  virtual bool splitNonContiguousRunsOnFailure() const {
+    return false;
+  }
+
   // Raw allocation hooks. The default implementations use libc
   // (malloc/aligned_alloc/calloc/realloc/free); a subclass (e.g. a pinned-host
   // allocator) overrides these to change the backing memory while

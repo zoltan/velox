@@ -503,6 +503,9 @@ class MemoryAllocator : public std::enable_shared_from_this<MemoryAllocator> {
     int32_t numSizes{0};
     // Total number of pages.
     int32_t totalPages{0};
+    // Smallest run the caller permits, including when a backing allocator
+    // subdivides a size-class block to reuse fragmented free space.
+    MachinePageCount minSizeClass{1};
 
     SizeMix() {
       sizeIndices.reserve(kMaxSizeClasses);
