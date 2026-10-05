@@ -246,6 +246,17 @@ CudfSplitReader::CudfSplitReader(
       hiveConfig.isFileColumnNamesReadAsLowerCase(sessionProperties);
 }
 
+void CudfSplitReader::setMemoryResources(
+    cuda::mr::any_resource<cuda::mr::device_accessible> temp,
+    cuda::mr::any_resource<cuda::mr::device_accessible> output) {
+  VELOX_CHECK(
+      !tempMemoryResource_ && !outputMemoryResource_ && !splitReader_ &&
+          !passState_ && fileMetaDatas_.empty(),
+      "Memory resources must be set once, before split preparation");
+  tempMemoryResource_ = std::move(temp);
+  outputMemoryResource_ = std::move(output);
+}
+
 CudfSplitReader::~CudfSplitReader() {
   // A split abandoned before it is read, e.g. when the task is cancelled while
   // the preloader prepares it, can still have reads in flight or queued.
@@ -349,6 +360,10 @@ void CudfSplitReader::setPushdownFilter(const cudf::ast::expression* filter) {
 }
 
 void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
+  std::optional<ScopedCudfMemoryResources> memoryResources;
+  if (tempMemoryResource_) {
+    memoryResources.emplace(*tempMemoryResource_, *outputMemoryResource_);
+  }
   stream_ = cudfGlobalStreamPool().get_stream();
   fileMetaDatas();
   if (emptySplit_) {
@@ -371,6 +386,12 @@ void CudfSplitReader::prepareSplit(dwio::common::RuntimeStats& runtimeStats) {
 
 std::optional<CudfSplitReader::TableChunk> CudfSplitReader::next(
     uint64_t /*size*/) {
+  // Older cuDF decode APIs still allocate temporaries through the current MR.
+  // Use the reader's resources even after adoption by a different source.
+  std::optional<ScopedCudfMemoryResources> memoryResources;
+  if (tempMemoryResource_) {
+    memoryResources.emplace(*tempMemoryResource_, *outputMemoryResource_);
+  }
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   // Record start time before reading chunk
@@ -482,7 +503,7 @@ void CudfSplitReader::startColumnChunkFetch() {
       columnChunkByteRanges,
       serializeIoRequests_,
       stream_,
-      {get_temp_mr(), get_temp_mr()});
+      {tempMemoryResource(), tempMemoryResource()});
   nvtxRangePop();
 }
 
@@ -748,7 +769,7 @@ void CudfSplitReader::setupReaderOptions() {
 
 rmm::device_async_resource_ref CudfSplitReader::determineCudfMemoryResource()
     const {
-  return get_output_mr();
+  return outputMemoryResource();
 }
 
 const std::vector<cudf::io::parquet::FileMetaData>&

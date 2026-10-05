@@ -19,6 +19,8 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
+#include "velox/experimental/cudf/exec/CudfMemoryResource.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
@@ -183,6 +185,14 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
     // ISO date.
     bool dateValueDaysSinceEpoch;
   };
+
+  std::optional<ScopedCudfMemoryResources> scopedMemoryResources();
+
+  // Source-local accounting handles. Readers copy owning handles before any
+  // asynchronous preparation; buffers independently retain their resources.
+  std::shared_ptr<memory::MemoryPool> gpuPoolOwner_;
+  std::optional<CudfMemoryResource> gpuTempResource_;
+  std::optional<CudfMemoryResource> gpuOutputResource_;
 
   // Construct and cache a RowTypePtr for the table column names and types.
   const RowTypePtr getTableRowType();
