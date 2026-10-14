@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/exec/CudfMemoryResource.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -444,6 +445,7 @@ CudfHiveDataSource::CudfHiveDataSource(
       partitionKeySource_(partitionKeySource) {
   if (auto* gpuPool =
           connectorQueryCtx_->customMemoryPool(kCudfMemoryResourceTag)) {
+    ensureCudfMemoryReclaimer(*gpuPool);
     VELOX_CHECK(
         mr_.has_value() && output_mr_.has_value(),
         "cuDF memory resources must be initialized before table scan");
