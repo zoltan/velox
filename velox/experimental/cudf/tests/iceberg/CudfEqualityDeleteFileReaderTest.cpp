@@ -112,7 +112,9 @@ TEST_P(CudfEqualityDeleteFileReaderTest, accountsScanAndDeleteBuffers) {
       "gpu",
       std::make_shared<memory::MallocAllocator>(options),
       memory::MemoryArbitrator::create({}),
-      [] { return memory::MemoryReclaimer::create(); });
+      [](const memory::ReclaimerContext&) {
+        return memory::MemoryReclaimer::create();
+      });
   // Production retains this backend for the process lifetime. In the test it
   // must outlive asynchronous task cleanup, including assertion failures.
   SCOPE_EXIT {
