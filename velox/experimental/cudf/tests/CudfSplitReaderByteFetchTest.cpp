@@ -17,6 +17,9 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
 
+#include "velox/common/base/Exceptions.h"
+#include "velox/common/base/tests/GTestUtils.h"
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
@@ -28,6 +31,7 @@
 #include <future>
 #include <memory>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -104,7 +108,8 @@ class ResidentRange final : public cudf::io::datasource::buffer {
 };
 
 // Models cached bytes with both owning and caller-allocated read interfaces.
-class ResidentDeviceSource final : public CopyDeviceSource {
+class ResidentDeviceSource : public CopyDeviceSource,
+                             public gpu::DeviceReadSource {
  public:
   using CopyDeviceSource::CopyDeviceSource;
   using CopyDeviceSource::device_read;
@@ -117,7 +122,55 @@ class ResidentDeviceSource final : public CopyDeviceSource {
     return std::make_unique<ResidentRange>(allocation_, offset, length);
   }
 
+  gpu::DeviceReadBatch readDeviceRangesAsync(
+      std::span<const gpu::DeviceByteRange> ranges,
+      bool /*serializeSubmissions*/,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref /*outputResource*/,
+      rmm::device_async_resource_ref /*temporaryResource*/) override {
+    auto buffers = std::make_shared<
+        std::vector<std::unique_ptr<cudf::io::datasource::buffer>>>();
+    gpu::DeviceReadBatch result;
+    result.owner = buffers;
+    for (const auto& range : ranges) {
+      auto buffer = device_read(range.offset(), range.size(), stream);
+      result.data.emplace_back(buffer->data(), buffer->size());
+      buffers->push_back(std::move(buffer));
+    }
+    return result;
+  }
+
   std::atomic<size_t> numOwnedReads{0};
+};
+
+// Exercises the same datasource allocation path used by BufferedInput.
+class AllocatingDeviceSource final
+    : public CopyDeviceSource,
+      public gpu::DeviceReadSource,
+      public std::enable_shared_from_this<AllocatingDeviceSource> {
+ public:
+  using CopyDeviceSource::CopyDeviceSource;
+
+  gpu::DeviceReadBatch readDeviceRangesAsync(
+      std::span<const gpu::DeviceByteRange> ranges,
+      bool serializeSubmissions,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref outputResource,
+      rmm::device_async_resource_ref temporaryResource) override {
+    ++numBatchReads;
+    std::vector<cudf::io::text::byte_range_info> byteRanges;
+    for (const auto& range : ranges) {
+      byteRanges.emplace_back(range.offset(), range.size());
+    }
+    return copyByteRangesAsync(
+        shared_from_this(),
+        {byteRanges.data(), byteRanges.size()},
+        serializeSubmissions,
+        stream,
+        {outputResource, temporaryResource});
+  }
+
+  size_t numBatchReads{0};
 };
 
 class CudfSplitReaderByteFetchTest : public testing::Test {
@@ -134,9 +187,7 @@ class CudfSplitReaderByteFetchTest : public testing::Test {
     return allocation;
   }
 
-  void verify(
-      cudf::device_span<const uint8_t> data,
-      cudf::io::text::byte_range_info range) {
+  void verify(gpu::DeviceByteView data, cudf::io::text::byte_range_info range) {
     ASSERT_EQ(data.size(), range.size());
     std::vector<uint8_t> actual(data.size());
     CUDF_CUDA_TRY(cudaMemcpyAsync(
@@ -246,6 +297,209 @@ TEST_F(CudfSplitReaderByteFetchTest, copyOnlySourceRemainsSupported) {
     ASSERT_THAT(fetch.data, testing::SizeIs(1));
     verify(fetch.data.front(), range);
   }
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, allocationAndCoalescingMatchCopyPath) {
+  for (const bool serialize : {false, true}) {
+    SCOPED_TRACE(serialize);
+    auto allocation = populate();
+    auto baseline = std::make_shared<CopyDeviceSource>(allocation);
+    auto source = std::make_shared<AllocatingDeviceSource>(allocation);
+    const std::vector<cudf::io::text::byte_range_info> ranges{
+        {19, 37}, {56, 48}, {200, 17}};
+    auto read = [&](const auto& dataSource) {
+      rmm::mr::statistics_resource_adaptor allocations{resource_};
+      int64_t totalBytes{0};
+      {
+        auto fetch = fetchByteRangesAsync(
+            dataSource,
+            {ranges.data(), ranges.size()},
+            serialize,
+            stream_,
+            {allocations, allocations});
+        fetch.waitOn(stream_);
+        ASSERT_THAT(fetch.data, testing::SizeIs(ranges.size()));
+        for (size_t i = 0; i < ranges.size(); ++i) {
+          verify(fetch.data[i], ranges[i]);
+        }
+        totalBytes = allocations.get_bytes_counter().total;
+        EXPECT_EQ(totalBytes, 104);
+        EXPECT_EQ(allocations.get_allocations_counter().total, 1);
+      }
+      EXPECT_EQ(allocations.get_bytes_counter().value, 0);
+    };
+    read(baseline);
+    read(source);
+    EXPECT_EQ(source->numBatchReads, 1);
+    EXPECT_EQ(baseline->numCopiedReads.load(), 2);
+    EXPECT_EQ(source->numCopiedReads.load(), 2);
+  }
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, rejectsMalformedOwnedBatches) {
+  // Corrupt the provider's result without changing its production lifetime.
+  class MalformedSource final : public ResidentDeviceSource {
+   public:
+    enum class Failure { kOwner, kCount, kSize, kPointer };
+
+    MalformedSource(
+        std::shared_ptr<rmm::device_buffer> allocation,
+        Failure failure)
+        : ResidentDeviceSource(std::move(allocation)), failure_{failure} {}
+
+    gpu::DeviceReadBatch readDeviceRangesAsync(
+        std::span<const gpu::DeviceByteRange> ranges,
+        bool serializeSubmissions,
+        cuda::stream_ref stream,
+        rmm::device_async_resource_ref outputResource,
+        rmm::device_async_resource_ref temporaryResource) override {
+      auto batch = ResidentDeviceSource::readDeviceRangesAsync(
+          ranges,
+          serializeSubmissions,
+          stream,
+          outputResource,
+          temporaryResource);
+      switch (failure_) {
+        case Failure::kOwner:
+          batch.owner.reset();
+          break;
+        case Failure::kCount:
+          batch.data.clear();
+          break;
+        case Failure::kSize:
+          batch.data.front() = {batch.data.front().data(), 1};
+          break;
+        case Failure::kPointer:
+          batch.data.front() = {nullptr, batch.data.front().size()};
+          break;
+      }
+      return batch;
+    }
+
+   private:
+    const Failure failure_;
+  };
+  using Failure = MalformedSource::Failure;
+  const std::vector<std::pair<Failure, std::string>> cases{
+      {Failure::kOwner, "Missing device range owner"},
+      {Failure::kCount, "Device range count mismatch"},
+      {Failure::kSize, "Device range size mismatch"},
+      {Failure::kPointer, "Null device range data"}};
+  const cudf::io::text::byte_range_info range{19, 37};
+  for (const auto& [failure, message] : cases) {
+    SCOPED_TRACE(message);
+    auto source = std::make_shared<MalformedSource>(populate(), failure);
+    VELOX_ASSERT_THROW(
+        fetchByteRangesAsync(
+            source, {&range, 1}, false, stream_, {resource_, resource_}),
+        message);
+  }
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, invalidResidentRangesFailBeforeRead) {
+  auto source = std::make_shared<ResidentDeviceSource>(populate());
+  const std::vector<std::pair<cudf::io::text::byte_range_info, std::string>>
+      cases{
+          {{4'097, 0}, "Byte range exceeds datasource size"},
+          {{4'095, 2}, "Byte range exceeds datasource size"}};
+  for (const auto& [range, message] : cases) {
+    SCOPED_TRACE(message);
+    VELOX_ASSERT_THROW(
+        fetchByteRangesAsync(
+            source, {&range, 1}, false, stream_, {resource_, resource_}),
+        message);
+  }
+  EXPECT_EQ(source->numOwnedReads.load(), 0);
+  EXPECT_EQ(source->numCopiedReads.load(), 0);
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, emptyResidentBatchIsStarted) {
+  auto source = std::make_shared<ResidentDeviceSource>(populate());
+  auto fetch =
+      fetchByteRangesAsync(source, {}, false, stream_, {resource_, resource_});
+  EXPECT_TRUE(static_cast<bool>(fetch));
+  EXPECT_FALSE(fetch.pending.valid());
+  EXPECT_THAT(fetch.data, testing::IsEmpty());
+  fetch.waitOn(stream_);
+  fetch = {};
+  EXPECT_FALSE(static_cast<bool>(fetch));
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, retainsSourceBeforeWaiting) {
+  for (const bool resident : {false, true}) {
+    SCOPED_TRACE(resident);
+    std::shared_ptr<CopyDeviceSource> source;
+    if (resident) {
+      source = std::make_shared<ResidentDeviceSource>(populate());
+    } else {
+      source = std::make_shared<CopyDeviceSource>(populate());
+    }
+    std::weak_ptr<CopyDeviceSource> lifetime = source;
+    const cudf::io::text::byte_range_info range{19, 37};
+    auto fetch = fetchByteRangesAsync(
+        source, {&range, 1}, false, stream_, {resource_, resource_});
+    source.reset();
+    EXPECT_FALSE(lifetime.expired());
+    fetch.waitOn(stream_);
+    verify(fetch.data.front(), range);
+    fetch = {};
+    EXPECT_TRUE(lifetime.expired());
+  }
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, finishesSubmissionBeforeRelease) {
+  for (const bool replace : {false, true}) {
+    SCOPED_TRACE(replace);
+    bool submitted{false};
+    auto allocation = populate();
+    std::weak_ptr<rmm::device_buffer> lifetime = allocation;
+    {
+      gpu::DeviceReadBatch batch;
+      batch.owner = std::move(allocation);
+      batch.pending = std::async(std::launch::deferred, [&] {
+        EXPECT_FALSE(lifetime.expired());
+        submitted = true;
+      });
+      if (replace) {
+        batch = {};
+        EXPECT_TRUE(submitted);
+        EXPECT_TRUE(lifetime.expired());
+      }
+    }
+    EXPECT_TRUE(submitted);
+    EXPECT_TRUE(lifetime.expired());
+  }
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, waitPropagatesReadFailure) {
+  gpu::DeviceReadBatch batch;
+  batch.owner = populate();
+  batch.pending = std::async(std::launch::deferred, [] {
+    throw std::runtime_error("Read failed before submission");
+  });
+  try {
+    batch.wait();
+    FAIL() << "Expected read failure";
+  } catch (const std::runtime_error& error) {
+    EXPECT_STREQ(error.what(), "Read failed before submission");
+  }
+  EXPECT_FALSE(batch.pending.valid());
+  batch.wait();
+}
+
+TEST_F(CudfSplitReaderByteFetchTest, ordersFirstConsumerAfterProduction) {
+  gpu::DeviceReadBatch batch;
+  batch.owner = populate();
+  bool submitted{false};
+  bool ready{false};
+  batch.pending = std::async(std::launch::deferred, [&] { submitted = true; });
+  batch.ready = [&](cuda::stream_ref consumer) {
+    EXPECT_TRUE(submitted);
+    EXPECT_EQ(consumer.get(), stream_.value());
+    ready = true;
+  };
+  batch.waitOn(stream_);
+  EXPECT_TRUE(ready);
 }
 
 } // namespace

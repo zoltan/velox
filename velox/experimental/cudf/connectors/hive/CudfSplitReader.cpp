@@ -463,7 +463,7 @@ void CudfSplitReader::startColumnChunkFetch() {
   // the chunking is already setup.
   if (passState_ == nullptr or
       passState_->currentPass >= passState_->passes.size() or
-      passState_->fetch.pending.valid() or passState_->isChunkingSetup) {
+      static_cast<bool>(passState_->fetch) or passState_->isChunkingSetup) {
     return;
   }
 
@@ -492,13 +492,18 @@ void CudfSplitReader::setupChunkingForCurrentPass(
   startColumnChunkFetch();
 
   // Wait for all reads of the pass to complete.
-  passState_->fetch.wait();
+  passState_->fetch.waitOn(stream_);
 
+  std::vector<cudf::device_span<const uint8_t>> deviceViews;
+  deviceViews.reserve(passState_->fetch.data.size());
+  for (const auto& view : passState_->fetch.data) {
+    deviceViews.emplace_back(view.data(), view.size());
+  }
   splitReader_->setup_chunking_for_all_columns(
       chunkReadLimit_,
       passReadLimit_,
       passState_->passes[passState_->currentPass],
-      passState_->fetch.data,
+      deviceViews,
       readerOptions_,
       stream_,
       mr);
@@ -691,7 +696,7 @@ void CudfSplitReader::setupCudfDataSource() {
     return;
   }
   dataSource_ =
-      std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+      std::make_shared<BufferedInputDataSource>(std::move(bufferedInput));
 }
 
 void CudfSplitReader::setupReaderOptions() {

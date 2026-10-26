@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/gpu/DeviceReadSource.h"
+
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/io/datasource.hpp>
@@ -31,7 +33,10 @@ namespace facebook::velox::cudf_velox::connector::hive {
 // A cudf::io::datasource that serves bytes via Velox BufferedInput so that
 // reads benefit from AsyncDataCache / SSD cache and are always returned as
 // contiguous buffers.
-class BufferedInputDataSource : public cudf::io::datasource {
+class BufferedInputDataSource
+    : public cudf::io::datasource,
+      public gpu::DeviceReadSource,
+      public std::enable_shared_from_this<BufferedInputDataSource> {
  public:
   explicit BufferedInputDataSource(
       std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input);
@@ -56,6 +61,14 @@ class BufferedInputDataSource : public cudf::io::datasource {
       size_t size,
       uint8_t* dst,
       cuda::stream_ref stream) override;
+
+  /// Returns datasource-owned input using the existing batched copy algorithm.
+  gpu::DeviceReadBatch readDeviceRangesAsync(
+      std::span<const gpu::DeviceByteRange> ranges,
+      bool serializeSubmissions,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref outputResource,
+      rmm::device_async_resource_ref temporaryResource) override;
 
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);

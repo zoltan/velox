@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if(VELOX_ENABLE_CUDF)
+  add_library(velox_gpu_device_input DeviceReadSource.cpp DeviceReadSource.h)
+  target_link_libraries(velox_gpu_device_input PUBLIC rmm::rmm CUDA::cudart)
+endif()
+
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()

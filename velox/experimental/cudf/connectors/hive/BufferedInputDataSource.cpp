@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
 #include "velox/common/base/Exceptions.h"
@@ -117,6 +118,25 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
             stream.get()));
         return hostBuffer->size();
       });
+}
+
+gpu::DeviceReadBatch BufferedInputDataSource::readDeviceRangesAsync(
+    std::span<const gpu::DeviceByteRange> ranges,
+    bool serializeSubmissions,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref outputResource,
+    rmm::device_async_resource_ref temporaryResource) {
+  std::vector<cudf::io::text::byte_range_info> byteRanges;
+  byteRanges.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    byteRanges.emplace_back(range.offset(), range.size());
+  }
+  return copyByteRangesAsync(
+      shared_from_this(),
+      {byteRanges.data(), byteRanges.size()},
+      serializeSubmissions,
+      stream,
+      {outputResource, temporaryResource});
 }
 
 bool BufferedInputDataSource::supports_device_read() const {

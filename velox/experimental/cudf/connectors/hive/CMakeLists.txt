@@ -28,7 +28,7 @@ add_library(
 target_link_libraries(
   velox_cudf_hive_connector
   PRIVATE velox_common_io velox_dwio_common velox_hive_connector
-  PUBLIC cudf::cudf nvtx3::nvtx3-cpp velox_cudf_expression
+  PUBLIC cudf::cudf nvtx3::nvtx3-cpp velox_cudf_expression velox_gpu_device_input
 )
 
 if(VELOX_ENABLE_ABFS)

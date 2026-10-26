@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/gpu/DeviceReadSource.h"
+
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/utilities/span.hpp>
@@ -31,24 +33,25 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
-// Owns device buffers and tracks reads filling them.
-struct ByteRangeFetch {
-  // Device buffers for requested byte ranges.
-  std::vector<rmm::device_buffer> buffers;
+/// Owns source-provided input and its pending reads.
+using ByteRangeFetch = gpu::DeviceReadBatch;
 
-  // Device span per requested range. Valid after 'wait()'.
-  std::vector<cudf::device_span<const uint8_t>> data;
-
-  // Completes when reads finish. Invalid without an in-flight fetch.
-  std::future<void> pending;
-
-  // Waits for reads and rethrows any failure. No-op when complete.
-  void wait();
-};
-
-// Starts cuDF's asynchronous byte-range fetch. Wait for returned fetch before
-// using its data.
+/// Fetches source-owned bytes when supported, or uses cuDF's copy path.
+/// Retains the source until pending work completes. Providers must supply
+/// backing storage padded for cuDF's Parquet decoder (8-byte allocation tail
+/// alignment), matching fetch_byte_ranges_to_device_async. Consume on the
+/// supplied stream and retain the batch until the last use is submitted.
 ByteRangeFetch fetchByteRangesAsync(
+    std::shared_ptr<cudf::io::datasource> dataSource,
+    cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
+    bool serializeSubmissions,
+    cuda::stream_ref stream,
+    cudf::memory_resources mr);
+
+/// Allocates and fills device input with cuDF's existing batched copy
+/// algorithm. Bypasses ownership dispatch so datasource implementations can
+/// reuse it.
+ByteRangeFetch copyByteRangesAsync(
     std::shared_ptr<cudf::io::datasource> dataSource,
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
     bool serializeSubmissions,
