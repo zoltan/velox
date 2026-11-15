@@ -26,6 +26,13 @@ namespace facebook::velox::exec::test {
 
 namespace {
 
+// Q15 compares independently aggregated revenue for equality. Decimal input
+// makes the result independent of parallel floating-point summation order.
+constexpr const char* kQ15Revenue =
+    "cast(l_extendedprice as decimal(15, 2)) * "
+    "(cast(1 as decimal(3, 2)) - cast(l_discount as decimal(3, 2)))";
+
+
 /// DWRF does not support Date type and Varchar is used.
 /// Return the Date filter expression as per data format.
 std::string formatDateFilter(
@@ -1730,8 +1737,7 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
               {shipDateFilter})
           .captureScanNodeId(lineitemScanNodeId)
           .project(
-              {"l_suppkey",
-               "l_extendedprice * (1.0 - l_discount) as part_revenue"})
+              {"l_suppkey", fmt::format("{} as part_revenue", kQ15Revenue)})
           .partialAggregation(
               {"l_suppkey"}, {"sum(part_revenue) as total_revenue"})
           .localPartition(std::vector<std::string>{})
@@ -1750,7 +1756,7 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
           .captureScanNodeId(lineitemScanNodeIdSubQuery)
           .project(
               {"l_suppkey as supplier_no",
-               "l_extendedprice * (1.0 - l_discount) as part_revenue"})
+               fmt::format("{} as part_revenue", kQ15Revenue)})
           .partialAggregation(
               {"supplier_no"}, {"sum(part_revenue) as total_revenue"})
           .localPartition(std::vector<std::string>{})
@@ -1774,6 +1780,12 @@ TpchPlan TpchQueryBuilder::getQ15Plan() const {
               supplierWithMaxRevenue,
               "",
               {"s_suppkey", "s_name", "s_address", "s_phone", "total_revenue"})
+          .project(
+              {"s_suppkey",
+               "s_name",
+               "s_address",
+               "s_phone",
+               "cast(total_revenue as double) as total_revenue"})
           .orderBy({"s_suppkey"}, false)
           .planNode();
 
