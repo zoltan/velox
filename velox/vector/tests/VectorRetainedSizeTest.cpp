@@ -17,6 +17,7 @@
 #include <functional>
 
 #include <gtest/gtest.h>
+#include "velox/vector/FlatMapVector.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 namespace facebook::velox::test {
@@ -37,6 +38,54 @@ class VectorRetainedSizeTest : public testing::Test,
 };
 
 } // namespace
+
+TEST_F(VectorRetainedSizeTest, nestedFlatMaps) {
+  auto keys = makeFlatVector<std::string>({std::string(40, 'k')});
+  auto values = makeFlatVector<std::string>(
+      8, [](auto i) { return std::string(40 + i, 'v'); });
+  auto nulls = makeNulls(8, [](auto i) { return i == 0; });
+  auto inMap = makeNulls(8, [](auto i) { return i % 2 == 0; });
+  auto inner = std::make_shared<FlatMapVector>(
+      pool(),
+      MAP(VARCHAR(), VARCHAR()),
+      nulls,
+      8,
+      keys,
+      std::vector<VectorPtr>{values},
+      std::vector<BufferPtr>{inMap});
+  const auto innerBytes = nulls->capacity() + keys->retainedSize() +
+      values->retainedSize() + inMap->capacity();
+  uint64_t strings = 7; // The recursive API must accumulate, not overwrite.
+  EXPECT_EQ(inner->retainedSize(strings), innerBytes);
+  EXPECT_EQ(strings, 7 + keys->stringBufferSize() + values->stringBufferSize());
+
+  auto outerKeys = makeFlatVector<int64_t>({1});
+  auto outer = std::make_shared<FlatMapVector>(
+      pool(),
+      MAP(BIGINT(), inner->type()),
+      nullptr,
+      8,
+      outerKeys,
+      std::vector<VectorPtr>{inner},
+      std::vector<BufferPtr>{nullptr});
+  strings = 0;
+  EXPECT_EQ(
+      outer->retainedSize(strings), outerKeys->retainedSize() + innerBytes);
+  EXPECT_EQ(strings, keys->stringBufferSize() + values->stringBufferSize());
+  auto row = makeRowVector({outer});
+  EXPECT_EQ(row->retainedSize(), outer->retainedSize());
+
+  // Missing value vectors and absent in-map buffers are valid during setup.
+  auto missing = std::make_shared<FlatMapVector>(
+      pool(),
+      MAP(BIGINT(), inner->type()),
+      nullptr,
+      8,
+      outerKeys,
+      std::vector<VectorPtr>{nullptr},
+      std::vector<BufferPtr>{});
+  EXPECT_EQ(missing->retainedSize(), outerKeys->retainedSize());
+}
 
 TEST_F(VectorRetainedSizeTest, flatNoStrings) {
   auto vector = makeFlatIdentityVector<int32_t>(1'000);

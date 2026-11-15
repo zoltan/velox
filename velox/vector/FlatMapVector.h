@@ -459,13 +459,22 @@ class FlatMapVector : public BaseVector {
       vector_size_t wrappedOtherIndex,
       CompareFlags flags) const;
 
-  uint64_t retainedSizeImpl(
-      uint64_t& /*totalStringBufferSize*/) const override {
-    // TODO: since FlatMapVector didn't override BaseVector::retainedSize(),
-    // this override of retainedSizeImpl keeps the original behavior of
-    // FlatMapVector::retainedSize(). We should update this method to reflect
-    // the actual memory usage of FlatMapVector.
-    return BaseVector::retainedSizeImpl();
+  uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
+    auto size = BaseVector::retainedSizeImpl();
+    if (distinctKeys_) {
+      size += distinctKeys_->retainedSize(totalStringBufferSize);
+    }
+    for (const auto& values : mapValues_) {
+      if (values) {
+        size += values->retainedSize(totalStringBufferSize);
+      }
+    }
+    for (const auto& inMap : inMaps_) {
+      if (inMap) {
+        size += inMap->capacity();
+      }
+    }
+    return size;
   }
 
   // Vector containing the distinct map keys.
