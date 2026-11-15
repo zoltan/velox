@@ -32,7 +32,7 @@ class JoinBridge {
 
   /// Sets this to a cancelled state and unblocks any waiting activity. This may
   /// happen asynchronously before or after the result has been set.
-  void cancel();
+  virtual void cancel();
 
  protected:
   static void notify(std::vector<ContinuePromise> promises);
