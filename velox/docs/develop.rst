@@ -24,6 +24,7 @@ This guide is intended for Velox contributors and developers of Velox-based appl
     develop/anti-join
     develop/hash-table-caching
     develop/operators
+    develop/cte
     develop/task
     develop/task-barrier
     develop/simd

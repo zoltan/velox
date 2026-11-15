@@ -2492,6 +2492,440 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
   return context;
 }
 
+TpchPlan TpchQueryBuilder::getCtePlan(
+    int queryId,
+    bool share,
+    const CteOptions& options) const {
+  VELOX_USER_CHECK(
+      queryId == 2 || queryId == 11 || queryId == 15 || queryId == 17 ||
+          queryId == 20 || queryId == 22,
+      "No CTE benchmark plan for Q{}", queryId);
+  TpchPlan context;
+  context.dataFileFormat = format_;
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto scan = [&](const std::string& table,
+                  const std::vector<std::string>& columns,
+                  const std::vector<std::string>& filters = {},
+                  const std::string& remaining = "") {
+    PlanBuilder builder(ids, pool_.get());
+    builder.filtersAsNode(filtersAsNode_).tableScan(
+        table, getRowType(table, columns), getFileColumnNames(table), filters,
+        remaining);
+    core::PlanNodeId id;
+    builder.captureScanNodeId(id);
+    context.dataFiles[id] = getTableFilePaths(table);
+    return builder;
+  };
+  auto nationSuppliers = [&](const std::string& name,
+                             const std::vector<std::string>& columns) {
+    auto nation = scan(
+                      kNation,
+                      {"n_nationkey", "n_name"},
+                      {fmt::format("n_name = '{}'", name)})
+                      .planNode();
+    return scan(kSupplier, columns)
+        .hashJoin({"s_nationkey"}, {"n_nationkey"}, nation, "", columns);
+  };
+  const std::string phoneFilter =
+      "substr(c_phone, 1, 2) IN ('13', '31', '23', '29', '30', '18', '17')";
+  // These are explicit translations of the six observed DuckDB SF10 sharing
+  // boundaries. Rebuilding this factory for each reader gives a controlled
+  // duplicate-work baseline with identical relational operators.
+  auto producer = [&]() -> core::PlanNodePtr {
+    switch (queryId) {
+      case 2: {
+        auto region =
+            scan(kRegion, {"r_regionkey", "r_name"}, {"r_name = 'EUROPE'"})
+                .planNode();
+        auto nation = scan(kNation, {"n_nationkey", "n_regionkey", "n_name"})
+                          .hashJoin(
+                              {"n_regionkey"},
+                              {"r_regionkey"},
+                              region,
+                              "",
+                              {"n_nationkey", "n_name"})
+                          .planNode();
+        auto supplier = scan(
+                            kSupplier,
+                            {"s_suppkey",
+                             "s_nationkey",
+                             "s_acctbal",
+                             "s_name",
+                             "s_address",
+                             "s_phone",
+                             "s_comment"})
+                            .hashJoin(
+                                {"s_nationkey"},
+                                {"n_nationkey"},
+                                nation,
+                                "",
+                                {"s_suppkey",
+                                 "s_acctbal",
+                                 "s_name",
+                                 "s_address",
+                                 "s_phone",
+                                 "s_comment",
+                                 "n_name"})
+                            .planNode();
+        auto part = scan(
+                        kPart,
+                        {"p_partkey", "p_mfgr", "p_size", "p_type"},
+                        {"p_size = 15"},
+                        "p_type like '%BRASS'")
+                        .planNode();
+        return scan(kPartsupp, {"ps_partkey", "ps_suppkey", "ps_supplycost"})
+            .hashJoin(
+                {"ps_partkey"},
+                {"p_partkey"},
+                part,
+                "",
+                {"p_partkey", "p_mfgr", "ps_suppkey", "ps_supplycost"})
+            .hashJoin(
+                {"ps_suppkey"},
+                {"s_suppkey"},
+                supplier,
+                "",
+                {"p_partkey",
+                 "ps_supplycost",
+                 "s_acctbal",
+                 "s_name",
+                 "n_name",
+                 "p_mfgr",
+                 "s_address",
+                 "s_phone",
+                 "s_comment"})
+            .planNode();
+      }
+      case 11: {
+        auto supplier =
+            nationSuppliers("GERMANY", {"s_suppkey", "s_nationkey"}).planNode();
+        return scan(
+                   kPartsupp,
+                   {"ps_partkey", "ps_suppkey", "ps_supplycost", "ps_availqty"})
+            .hashJoin(
+                {"ps_suppkey"},
+                {"s_suppkey"},
+                supplier,
+                "",
+                {"ps_partkey", "ps_supplycost", "ps_availqty"})
+            .project(
+                {"ps_partkey",
+                 "ps_supplycost * ps_availqty as product_cost_qty"})
+            .planNode();
+      }
+      case 15: {
+        const std::vector<std::string> columns = {
+            "l_suppkey", "l_shipdate", "l_extendedprice", "l_discount"};
+        auto filter = formatDateFilter(
+            "l_shipdate",
+            getRowType(kLineitem, columns),
+            "'1996-01-01'",
+            "'1996-03-31'");
+        return scan(kLineitem, columns, {filter})
+            .project(
+                {"l_suppkey as supplier_no",
+                 fmt::format("{} as part_revenue", kQ15Revenue)})
+            .partialAggregation(
+                {"supplier_no"}, {"sum(part_revenue) as total_revenue"})
+            .localPartition({"supplier_no"})
+            .finalAggregation()
+            .planNode();
+      }
+      case 17: {
+        auto part = scan(
+                        kPart,
+                        {"p_partkey", "p_brand", "p_container"},
+                        {"p_brand = 'Brand#23'", "p_container = 'MED BOX'"})
+                        .planNode();
+        return scan(kLineitem, {"l_partkey", "l_quantity", "l_extendedprice"})
+            .hashJoin(
+                {"l_partkey"},
+                {"p_partkey"},
+                part,
+                "",
+                {"p_partkey", "l_quantity", "l_extendedprice"})
+            .planNode();
+      }
+      case 20: {
+        auto part =
+            scan(kPart, {"p_partkey", "p_name"}, {}, "p_name like 'forest%'")
+                .planNode();
+        return scan(kPartsupp, {"ps_partkey", "ps_suppkey", "ps_availqty"})
+            .hashJoin(
+                {"ps_partkey"},
+                {"p_partkey"},
+                part,
+                "",
+                {"ps_partkey", "ps_suppkey", "ps_availqty"},
+                core::JoinType::kLeftSemiFilter)
+            .planNode();
+      }
+      case 22: {
+        auto average =
+            scan(
+                kCustomer,
+                {"c_acctbal", "c_phone"},
+                {"c_acctbal > 0.0"},
+                phoneFilter)
+                .partialAggregation({}, {"avg(c_acctbal) as avg_acctbal"})
+                .localPartition({})
+                .finalAggregation()
+                .planNode();
+        return scan(
+                   kCustomer,
+                   {"c_custkey", "c_phone", "c_acctbal"},
+                   {},
+                   phoneFilter)
+            .nestedLoopJoin(
+                average, {"c_custkey", "c_phone", "c_acctbal", "avg_acctbal"})
+            .filter("c_acctbal > avg_acctbal")
+            .project({"c_custkey", "c_phone", "c_acctbal"})
+            .planNode();
+      }
+    }
+    VELOX_UNREACHABLE();
+  };
+  std::optional<Cte> cte;
+  if (share) {
+    auto source = producer();
+    cte.emplace(ids->next(), std::move(source));
+  }
+  auto read = [&]() {
+    return PlanBuilder(
+        share ? cte->scan(ids->next()) : producer(), ids, pool_.get());
+  };
+  core::PlanNodePtr result;
+  switch (queryId) {
+    case 2: {
+      auto minimum =
+          read()
+              .project({"p_partkey as min_partkey", "ps_supplycost"})
+              .partialAggregation(
+                  {"min_partkey"}, {"min(ps_supplycost) as min_cost"})
+              .localPartition({"min_partkey"})
+              .finalAggregation()
+              .planNode();
+      result = read()
+                   .hashJoin(
+                       {"p_partkey", "ps_supplycost"},
+                       {"min_partkey", "min_cost"},
+                       minimum,
+                       "",
+                       {"s_acctbal",
+                        "s_name",
+                        "n_name",
+                        "p_partkey",
+                        "p_mfgr",
+                        "s_address",
+                        "s_phone",
+                        "s_comment"})
+                   .localPartition({})
+                   .topN(
+                       {"s_acctbal DESC", "n_name", "s_name", "p_partkey"},
+                       100,
+                       false)
+                   .planNode();
+      break;
+    }
+    case 11: {
+      auto threshold =
+          read()
+              .partialAggregation({}, {"sum(product_cost_qty) as total_value"})
+              .localPartition({})
+              .finalAggregation()
+              .project({"total_value * 0.0001 as threshold"})
+              .planNode();
+      result =
+          read()
+              .partialAggregation(
+                  {"ps_partkey"}, {"sum(product_cost_qty) as value"})
+              .localPartition({"ps_partkey"})
+              .finalAggregation()
+              .nestedLoopJoin(threshold, {"ps_partkey", "value", "threshold"})
+              .filter("value > threshold")
+              .project({"ps_partkey", "value"})
+              .localPartition({})
+              .orderBy({"value DESC"}, false)
+              .planNode();
+      break;
+    }
+    case 15: {
+      auto maximum =
+          read()
+              .partialAggregation({}, {"max(total_revenue) as max_revenue"})
+              .localPartition({})
+              .finalAggregation()
+              .planNode();
+      auto winners = read()
+                         .hashJoin(
+                             {"total_revenue"},
+                             {"max_revenue"},
+                             maximum,
+                             "",
+                             {"supplier_no", "total_revenue"})
+                         .planNode();
+      result = scan(kSupplier, {"s_suppkey", "s_name", "s_address", "s_phone"})
+                   .hashJoin(
+                       {"s_suppkey"},
+                       {"supplier_no"},
+                       winners,
+                       "",
+                       {"s_suppkey",
+                        "s_name",
+                        "s_address",
+                        "s_phone",
+                        "total_revenue"})
+                   .localPartition({})
+                   .project(
+                       {"s_suppkey",
+                        "s_name",
+                        "s_address",
+                        "s_phone",
+                        "cast(total_revenue as double) as total_revenue"})
+                   .orderBy({"s_suppkey"}, false)
+                   .planNode();
+      break;
+    }
+    case 17: {
+      // DuckDB's delimiter consumer restricts the second lineitem scan using
+      // distinct correlation keys from the shared outer relation.
+      auto keys = read()
+                      .partialAggregation({"p_partkey"}, {})
+                      .localPartition({"p_partkey"})
+                      .finalAggregation()
+                      .project({"p_partkey as selected_part"})
+                      .planNode();
+      auto averages =
+          scan(kLineitem, {"l_partkey", "l_quantity"})
+              .hashJoin(
+                  {"l_partkey"},
+                  {"selected_part"},
+                  keys,
+                  "",
+                  {"l_partkey", "l_quantity"},
+                  core::JoinType::kLeftSemiFilter)
+              .partialAggregation(
+                  {"l_partkey"}, {"avg(l_quantity) as avg_quantity"})
+              .localPartition({"l_partkey"})
+              .finalAggregation()
+              .project(
+                  {"l_partkey as avg_partkey",
+                   "0.2 * avg_quantity as threshold"})
+              .planNode();
+      result =
+          read()
+              .hashJoin(
+                  {"p_partkey"},
+                  {"avg_partkey"},
+                  averages,
+                  "l_quantity < threshold",
+                  {"l_extendedprice"})
+              .partialAggregation({}, {"sum(l_extendedprice) as total_price"})
+              .localPartition({})
+              .finalAggregation()
+              .project({"total_price / 7.0 as avg_yearly"})
+              .planNode();
+      break;
+    }
+    case 20: {
+      auto keys = read()
+                      .partialAggregation({"ps_partkey", "ps_suppkey"}, {})
+                      .localPartition({"ps_partkey", "ps_suppkey"})
+                      .finalAggregation()
+                      .project(
+                          {"ps_partkey as selected_part",
+                           "ps_suppkey as selected_supplier"})
+                      .planNode();
+      const std::vector<std::string> columns = {
+          "l_partkey", "l_suppkey", "l_quantity", "l_shipdate"};
+      auto filter = formatDateFilter(
+          "l_shipdate",
+          getRowType(kLineitem, columns),
+          "'1994-01-01'",
+          "'1994-12-31'");
+      auto quantities =
+          scan(kLineitem, columns, {filter})
+              .hashJoin(
+                  {"l_partkey", "l_suppkey"},
+                  {"selected_part", "selected_supplier"},
+                  keys,
+                  "",
+                  {"l_partkey", "l_suppkey", "l_quantity"},
+                  core::JoinType::kLeftSemiFilter)
+              .partialAggregation(
+                  {"l_partkey", "l_suppkey"}, {"sum(l_quantity) as quantity"})
+              .localPartition({"l_partkey", "l_suppkey"})
+              .finalAggregation()
+              .project(
+                  {"l_partkey as agg_part",
+                   "l_suppkey as agg_supplier",
+                   "0.5 * quantity as threshold"})
+              .planNode();
+      auto qualifying = read()
+                            .hashJoin(
+                                {"ps_partkey", "ps_suppkey"},
+                                {"agg_part", "agg_supplier"},
+                                quantities,
+                                "ps_availqty > threshold",
+                                {"ps_suppkey"})
+                            .planNode();
+      result =
+          nationSuppliers(
+              "CANADA", {"s_suppkey", "s_nationkey", "s_name", "s_address"})
+              .hashJoin(
+                  {"s_suppkey"},
+                  {"ps_suppkey"},
+                  qualifying,
+                  "",
+                  {"s_name", "s_address"},
+                  core::JoinType::kLeftSemiFilter)
+              .localPartition({})
+              .orderBy({"s_name"}, false)
+              .planNode();
+      break;
+    }
+    case 22: {
+      auto keys = read()
+                      .partialAggregation({"c_custkey"}, {})
+                      .localPartition({"c_custkey"})
+                      .finalAggregation()
+                      .project({"c_custkey as selected_customer"})
+                      .planNode();
+      auto orders = scan(kOrders, {"o_custkey"})
+                        .hashJoin(
+                            {"o_custkey"},
+                            {"selected_customer"},
+                            keys,
+                            "",
+                            {"o_custkey"},
+                            core::JoinType::kLeftSemiFilter)
+                        .planNode();
+      result =
+          read()
+              .hashJoin(
+                  {"c_custkey"},
+                  {"o_custkey"},
+                  orders,
+                  "",
+                  {"c_phone", "c_acctbal"},
+                  core::JoinType::kAnti,
+                  false)
+              .project({"substr(c_phone, 1, 2) as country_code", "c_acctbal"})
+              .partialAggregation(
+                  {"country_code"},
+                  {"count(0) as numcust", "sum(c_acctbal) as totacctbal"})
+              .localPartition({"country_code"})
+              .finalAggregation()
+              .localPartition({})
+              .orderBy({"country_code"}, false)
+              .planNode();
+      break;
+    }
+  }
+  context.plan = share ? finalizeCtes(result, options) : result;
+  return context;
+}
+
 TpchPlan TpchQueryBuilder::getIoMeterPlan(int columnPct) const {
   VELOX_CHECK(columnPct > 0 && columnPct <= 100);
   auto columns = getFileColumnNames(kLineitem);

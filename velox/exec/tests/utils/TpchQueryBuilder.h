@@ -70,6 +70,16 @@ class TpchQueryBuilder {
   /// @param queryId TPC-H query number
   TpchPlan getQueryPlan(int queryId) const;
 
+  /// Explicit translations of DuckDB's observed Q2/Q11/Q15/Q17/Q20/Q22 CTE
+  /// sharing boundaries. With share=false, rebuild the same producer at each
+  /// reference to measure duplicate work independently of other plan changes.
+  /// These are hand-built relational plans, not a DuckDB physical-plan
+  /// importer.
+  TpchPlan getCtePlan(
+      int queryId,
+      bool share = true,
+      const CteOptions& options = {}) const;
+
   /// Get an alternate plan for a TPC-H query whose original predicate is not
   /// estimable from column statistics (e.g. a substring `like`). A cost-based
   /// optimizer mis-estimates such a predicate's selectivity and may pick a

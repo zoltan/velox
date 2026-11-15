@@ -19,6 +19,7 @@
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/CteInternal.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
@@ -196,7 +197,7 @@ std::unique_ptr<Operator> Operator::fromPlanNode(
       return op;
     }
   }
-  return nullptr;
+  return detail::sharedResultTranslator().toOperator(ctx, id, planNode);
 }
 
 // static
@@ -208,7 +209,7 @@ std::unique_ptr<JoinBridge> Operator::joinBridgeFromPlanNode(
       return joinBridge;
     }
   }
-  return nullptr;
+  return detail::sharedResultTranslator().toJoinBridge(planNode);
 }
 
 void Operator::initialize() {
@@ -232,7 +233,7 @@ OperatorSupplier Operator::operatorSupplierFromPlanNode(
       return supplier;
     }
   }
-  return nullptr;
+  return detail::sharedResultTranslator().toOperatorSupplier(planNode);
 }
 
 // static

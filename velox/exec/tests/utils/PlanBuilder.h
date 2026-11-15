@@ -22,6 +22,7 @@
 #include <velox/core/PlanNode.h>
 #include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/core/FixedPointPlanNodes.h"
+#include "velox/exec/Cte.h"
 #include "velox/parse/ExpressionsParser.h"
 #include "velox/parse/IExpr.h"
 #include "velox/parse/PlanNodeIdGenerator.h"
@@ -124,9 +125,27 @@ class PlanBuilder {
   virtual ~PlanBuilder() = default;
 
   /// Returns an empty PlanBuilder that shares this builder's
-  /// PlanNodeIdGenerator, memory pool and parse options, to build another
-  /// input of the same plan, e.g. a join's build side.
+  /// PlanNodeIdGenerator, memory pool and parse options, and copies its CTE
+  /// definitions to build another input of the same plan, e.g. a join's build
+  /// side.
   PlanBuilder newPlan() const;
+
+  /// Defines a named, non-recursive CTE using an empty builder that inherits
+  /// this builder's IDs, parsing options, and existing CTE definitions. Does
+  /// not change the current plan. Names must be non-empty and unique within
+  /// this builder. newPlan() inherits a snapshot of the definitions.
+  PlanBuilder& with(
+      const std::string& name,
+      const std::function<void(PlanBuilder&)>& definition);
+
+  /// Starts an independent reader of a named CTE. The default retains batches
+  /// for lagging readers, safely handling arbitrary consumer dependencies.
+  PlanBuilder& fromCte(const std::string& name);
+
+  /// Finalizes explicit CTEs in the complete local query.
+  /// Use planNode() for intermediate branches and build() at the query root.
+  /// Does not mutate this builder. See finalizeCtes() for execution scope.
+  core::PlanNodePtr build(const CteOptions& options = {}) const;
 
   static constexpr const std::string_view kHiveDefaultConnectorId{"test-hive"};
   static constexpr const std::string_view kTpchDefaultConnectorId{"test-tpch"};
@@ -1992,5 +2011,6 @@ class PlanBuilder {
   std::shared_ptr<core::PlanNodeIdGenerator> planNodeIdGenerator_;
   memory::MemoryPool* pool_;
   bool filtersAsNode_{false};
+  std::unordered_map<std::string, Cte> ctes_;
 };
 } // namespace facebook::velox::exec::test

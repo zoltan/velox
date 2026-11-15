@@ -73,7 +73,33 @@ PlanBuilder PlanBuilder::newPlan() const {
   PlanBuilder builder(planNodeIdGenerator_, pool_);
   builder.options_ = options_;
   builder.filtersAsNode_ = filtersAsNode_;
+  builder.ctes_ = ctes_;
   return builder;
+}
+
+PlanBuilder& PlanBuilder::with(
+    const std::string& name,
+    const std::function<void(PlanBuilder&)>& definition) {
+  VELOX_USER_CHECK(!name.empty(), "CTE name must not be empty");
+  VELOX_USER_CHECK(!ctes_.count(name), "CTE '{}' is already defined", name);
+  auto builder = newPlan();
+  definition(builder);
+  VELOX_USER_CHECK_NOT_NULL(builder.planNode(), "CTE '{}' has no plan", name);
+  ctes_.emplace(name, Cte(planNodeIdGenerator_->next(), builder.planNode()));
+  return *this;
+}
+
+PlanBuilder& PlanBuilder::fromCte(const std::string& name) {
+  VELOX_USER_CHECK(!planNode_, "fromCte requires an empty builder");
+  const auto it = ctes_.find(name);
+  VELOX_USER_CHECK(it != ctes_.end(), "Unknown CTE '{}'", name);
+  planNode_ = it->second.scan(planNodeIdGenerator_->next());
+  return *this;
+}
+
+core::PlanNodePtr PlanBuilder::build(const CteOptions& options) const {
+  VELOX_USER_CHECK_NOT_NULL(planNode_, "Cannot build an empty plan");
+  return finalizeCtes(planNode_, options);
 }
 
 PlanBuilder& PlanBuilder::tableScan(

@@ -26,6 +26,7 @@ velox_add_library(
   CallbackSink.cpp
   ColumnStatsCollector.cpp
   ContainerRowSerde.cpp
+  Cte.cpp
   DistinctAggregations.cpp
   Driver.cpp
   EnforceSingleRow.cpp
@@ -98,6 +99,7 @@ velox_add_library(
   RowNumber.cpp
   ScaleWriterLocalPartition.cpp
   ScaledScanController.cpp
+  SharedResultBuffer.cpp
   SortBuffer.cpp
   SortedAggregations.cpp
   SpatialJoinBuild.cpp
@@ -139,6 +141,8 @@ velox_add_library(
   CallbackSink.h
   ColumnStatsCollector.h
   ContainerRowSerde.h
+  Cte.h
+  CteInternal.h
   DistinctAggregations.h
   Driver.h
   DriverStats.h
@@ -224,6 +228,7 @@ velox_add_library(
   SetAccumulator.h
   SimpleAggregateAdapter.h
   SortBuffer.h
+  SharedResultBuffer.h
   SortedAggregations.h
   SpatialIndex.h
   SpatialJoinBuild.h

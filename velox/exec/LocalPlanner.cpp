@@ -21,6 +21,7 @@
 #include "velox/exec/ArrowStream.h"
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
+#include "velox/exec/CteInternal.h"
 #include "velox/exec/EnforceDistinct.h"
 #include "velox/exec/EnforceSingleRow.h"
 #include "velox/exec/Exchange.h"
@@ -416,6 +417,7 @@ void LocalPlanner::plan(
     std::vector<std::unique_ptr<DriverFactory>>* driverFactories,
     const core::QueryConfig& queryConfig,
     uint32_t maxDrivers) {
+  detail::validateCteExecution(planFragment);
   for (auto& adapter : DriverFactory::adapters) {
     if (adapter.inspect) {
       adapter.inspect(planFragment);

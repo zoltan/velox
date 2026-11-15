@@ -68,6 +68,7 @@ set(
   HashPartitionFunctionTest.cpp
   SpatialIndexTest.cpp
   ValuesTest.cpp
+  CteTest.cpp
   ParallelProjectTest.cpp
   # group1 (~599s): MultiFragmentTest 599 + 9 lightweight
   MultiFragmentTest.cpp
