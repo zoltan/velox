@@ -20,6 +20,7 @@
 #include "velox/common/time/CpuWallTimer.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DecodedVector.h"
+#include "velox/vector/FlatMapVector.h"
 #include "velox/vector/SelectivityVector.h"
 
 namespace facebook::velox {
@@ -122,6 +123,68 @@ void LazyVector::ensureLoadedRows(
 }
 
 namespace {
+// Inspect metadata and initialize fully loaded descendants bottom-up. Unlike
+// isLazyNotLoaded(), this includes lazy values inside all containers. This
+// never loads unresolved values or allocates row/element selection bitmaps.
+bool initializeIfFullyLoaded(const VectorPtr& vector) {
+  if (!vector) {
+    return true;
+  }
+  switch (vector->encoding()) {
+    case VectorEncoding::Simple::LAZY: {
+      const auto* lazy = vector->as<LazyVector>();
+      if (!lazy->isLoaded() ||
+          !initializeIfFullyLoaded(lazy->loadedVectorShared())) {
+        return false;
+      }
+      break;
+    }
+    case VectorEncoding::Simple::DICTIONARY:
+    case VectorEncoding::Simple::CONSTANT:
+    case VectorEncoding::Simple::SEQUENCE:
+      if (!initializeIfFullyLoaded(vector->valueVector())) {
+        return false;
+      }
+      break;
+    case VectorEncoding::Simple::ROW:
+      for (const auto& child : vector->as<RowVector>()->children()) {
+        if (!initializeIfFullyLoaded(child)) {
+          return false;
+        }
+      }
+      break;
+    case VectorEncoding::Simple::ARRAY:
+      if (!initializeIfFullyLoaded(vector->as<ArrayVector>()->elements())) {
+        return false;
+      }
+      break;
+    case VectorEncoding::Simple::MAP: {
+      const auto* map = vector->as<MapVector>();
+      if (!initializeIfFullyLoaded(map->mapKeys()) ||
+          !initializeIfFullyLoaded(map->mapValues())) {
+        return false;
+      }
+      break;
+    }
+    case VectorEncoding::Simple::FLAT_MAP: {
+      const auto* map = vector->as<FlatMapVector>();
+      if (!initializeIfFullyLoaded(map->distinctKeys())) {
+        return false;
+      }
+      for (const auto& values : map->mapValues()) {
+        if (!initializeIfFullyLoaded(values)) {
+          return false;
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  vector->loadedVector();
+  return true;
+}
+
 // Given a SelectivityVector 'rows', updates 'baseRows' selecting the rows
 // in the base vector that should be loaded.
 void selectBaseRowsToLoad(
@@ -130,7 +193,15 @@ void selectBaseRowsToLoad(
     const SelectivityVector& rows) {
   VELOX_DCHECK(
       decoded.base()->encoding() == VectorEncoding::Simple::ROW ||
+      decoded.base()->encoding() == VectorEncoding::Simple::FLAT_MAP ||
+      decoded.base()->encoding() == VectorEncoding::Simple::ARRAY ||
+      decoded.base()->encoding() == VectorEncoding::Simple::MAP ||
       decoded.base()->encoding() == VectorEncoding::Simple::LAZY);
+
+  if (!rows.hasSelections()) {
+    baseRows.resizeFill(0, false);
+    return;
+  }
 
   auto deselectNullsIdentity = [&]() {
     if (decoded.base()->rawNulls()) {
@@ -151,7 +222,9 @@ void selectBaseRowsToLoad(
     deselectNullsIdentity();
   } else if (decoded.isConstantMapping()) {
     baseRows.resizeFill(decoded.index(0) + 1, false);
-    baseRows.setValid(decoded.index(0), true);
+    if (!decoded.isNullAt(rows.begin())) {
+      baseRows.setValid(decoded.index(0), true);
+    }
   } else {
     baseRows.resizeFill(decoded.base()->size(), false);
     rows.applyToSelected([&](vector_size_t row) {
@@ -170,19 +243,79 @@ void LazyVector::ensureLoadedRowsImpl(
     const VectorPtr& vector,
     DecodedVector& decoded,
     const SelectivityVector& rows,
-    SelectivityVector& baseRows) {
+    SelectivityVector& baseRows,
+    bool loadAllChildren) {
   if (decoded.base()->encoding() != VectorEncoding::Simple::LAZY) {
     if (decoded.base()->encoding() == VectorEncoding::Simple::ROW &&
-        isLazyNotLoaded(*decoded.base())) {
+        (loadAllChildren || isLazyNotLoaded(*decoded.base()))) {
       auto* rowVector = decoded.base()->asUnchecked<RowVector>();
       selectBaseRowsToLoad(decoded, baseRows, rows);
       DecodedVector decodedChild;
       SelectivityVector childRows;
-      for (auto child : rowVector->children()) {
+      for (const auto& child : rowVector->children()) {
+        // Selective readers leave unprojected fields absent.
+        if (!child) {
+          continue;
+        }
+        if (loadAllChildren) {
+          ensureLoadedRowsRecursively(child, baseRows);
+          continue;
+        }
         decodedChild.decode(*child, baseRows, false);
-        ensureLoadedRowsImpl(child, decodedChild, baseRows, childRows);
+        ensureLoadedRowsImpl(
+            child, decodedChild, baseRows, childRows, loadAllChildren);
       }
       rowVector->invalidateContainsLazyNotLoaded();
+      vector->loadedVector();
+    } else if (
+        loadAllChildren &&
+        decoded.base()->encoding() == VectorEncoding::Simple::FLAT_MAP) {
+      const auto* map = decoded.base()->as<FlatMapVector>();
+      selectBaseRowsToLoad(decoded, baseRows, rows);
+      // Keys describe the channels independently of selected map rows.
+      ensureLoadedRowsRecursively(
+          map->distinctKeys(), SelectivityVector(map->numDistinctKeys()));
+      if (map->rawNulls()) {
+        baseRows.deselectNulls(
+            map->rawNulls(), baseRows.begin(), baseRows.end());
+      }
+      SelectivityVector valueRows;
+      for (column_index_t channel = 0; channel < map->numDistinctKeys();
+           ++channel) {
+        const auto& values = map->mapValuesAt(channel);
+        if (!values) {
+          continue;
+        }
+        valueRows = baseRows;
+        if (const auto* inMap = map->rawInMapsAt(channel)) {
+          valueRows.deselectNulls(inMap, baseRows.begin(), baseRows.end());
+        }
+        ensureLoadedRowsRecursively(values, valueRows);
+      }
+      vector->loadedVector();
+    } else if (
+        loadAllChildren &&
+        (decoded.base()->encoding() == VectorEncoding::Simple::ARRAY ||
+         decoded.base()->encoding() == VectorEncoding::Simple::MAP)) {
+      // A container may hold nested FlatMaps whose value channels are lazy.
+      const auto* container = decoded.base()->as<ArrayVectorBase>();
+      selectBaseRowsToLoad(decoded, baseRows, rows);
+      const bool isMap = container->encoding() == VectorEncoding::Simple::MAP;
+      const auto& values = isMap ? container->as<MapVector>()->mapValues()
+                                 : container->as<ArrayVector>()->elements();
+      SelectivityVector elements(values->size(), false);
+      baseRows.applyToSelected([&](auto row) {
+        if (!container->isNullAt(row)) {
+          const auto offset = container->offsetAt(row);
+          elements.setValidRange(offset, offset + container->sizeAt(row), true);
+        }
+      });
+      elements.updateBounds();
+      if (isMap) {
+        ensureLoadedRowsRecursively(
+            container->as<MapVector>()->mapKeys(), elements);
+      }
+      ensureLoadedRowsRecursively(values, elements);
       vector->loadedVector();
     }
     return;
@@ -195,7 +328,9 @@ void LazyVector::ensureLoadedRowsImpl(
     raw_vector<vector_size_t> rowNumbers(baseLazyVector->pool());
     RowSet rowSet;
     if (decoded.isConstantMapping()) {
-      rowNumbers.push_back(decoded.index(rows.begin()));
+      if (rows.hasSelections()) {
+        rowNumbers.push_back(decoded.index(rows.begin()));
+      }
       rowSet = RowSet(rowNumbers);
     } else if (decoded.isIdentityMapping()) {
       if (rows.isAllSelected()) {
@@ -203,17 +338,15 @@ void LazyVector::ensureLoadedRowsImpl(
         rowSet = RowSet(iota, rows.end());
       } else {
         rowNumbers.resize(rows.end());
-        rowNumbers.resize(
-            simd::indicesOfSetBits(
-                rows.asRange().bits(), 0, rows.end(), rowNumbers.data()));
+        rowNumbers.resize(simd::indicesOfSetBits(
+            rows.asRange().bits(), 0, rows.end(), rowNumbers.data()));
         rowSet = RowSet(rowNumbers);
       }
     } else {
       selectBaseRowsToLoad(decoded, baseRows, rows);
       rowNumbers.resize(baseRows.end());
-      rowNumbers.resize(
-          simd::indicesOfSetBits(
-              baseRows.asRange().bits(), 0, baseRows.end(), rowNumbers.data()));
+      rowNumbers.resize(simd::indicesOfSetBits(
+          baseRows.asRange().bits(), 0, baseRows.end(), rowNumbers.data()));
 
       rowSet = RowSet(rowNumbers);
     }
@@ -222,13 +355,17 @@ void LazyVector::ensureLoadedRowsImpl(
   }
 
   // The loaded vector can itself also be lazy, so we load recursively.
-  if (isLazyNotLoaded(*baseLazyVector->vector_)) {
-    // We do not neeed to decode all rows.
+  if (loadAllChildren || isLazyNotLoaded(*baseLazyVector->vector_)) {
+    // Preserve the original selection when descending into a loaded result.
     selectBaseRowsToLoad(decoded, baseRows, rows);
-    decoded.decode(*baseLazyVector->vector_, baseRows, false);
-    SelectivityVector nestedRows;
-    ensureLoadedRowsImpl(
-        baseLazyVector->vector_, decoded, baseRows, nestedRows);
+    if (loadAllChildren) {
+      ensureLoadedRowsRecursively(baseLazyVector->vector_, baseRows);
+    } else {
+      decoded.decode(*baseLazyVector->vector_, baseRows, false);
+      SelectivityVector nestedRows;
+      ensureLoadedRowsImpl(
+          baseLazyVector->vector_, decoded, baseRows, nestedRows);
+    }
   }
 
   // An explicit call to loadedVector() is necessary to allow for proper
@@ -245,6 +382,55 @@ void LazyVector::ensureLoadedRows(
     SelectivityVector& baseRows) {
   decoded.decode(*vector, rows, false);
   ensureLoadedRowsImpl(vector, decoded, rows, baseRows);
+}
+
+void LazyVector::ensureLoadedRowsRecursively(
+    const VectorPtr& vector,
+    const SelectivityVector& rows) {
+  if (initializeIfFullyLoaded(vector)) {
+    // No decoding or selections for trees that have no work left to load.
+    return;
+  }
+  // Peel wrappers one level at a time so sequences, including ones underneath
+  // dictionaries/constants, never reach DecodedVector (which rejects them).
+  const auto encoding = vector->encoding();
+  if (encoding == VectorEncoding::Simple::DICTIONARY ||
+      encoding == VectorEncoding::Simple::CONSTANT ||
+      encoding == VectorEncoding::Simple::SEQUENCE) {
+    const auto& values = vector->valueVector();
+    SelectivityVector selected(values->size(), false);
+    const auto* info = vector->wrapInfo()->as<vector_size_t>();
+    if (encoding == VectorEncoding::Simple::CONSTANT) {
+      if (rows.hasSelections()) {
+        selected.setValid(info[0], true);
+      }
+    } else if (encoding == VectorEncoding::Simple::DICTIONARY) {
+      rows.applyToSelected([&](auto row) {
+        if (!vector->rawNulls() || !bits::isBitNull(vector->rawNulls(), row)) {
+          selected.setValid(info[row], true);
+        }
+      });
+    } else {
+      vector_size_t run = 0;
+      vector_size_t end = values->size() ? info[0] : 0;
+      rows.applyToSelected([&](auto row) {
+        while (row >= end) {
+          end += info[++run];
+        }
+        selected.setValid(run, true);
+      });
+    }
+    selected.updateBounds();
+    ensureLoadedRowsRecursively(values, selected);
+    vector->loadedVector();
+    return;
+  }
+  DecodedVector decoded;
+  SelectivityVector baseRows;
+  decoded.decode(*vector, rows, false);
+  ensureLoadedRowsImpl(vector, decoded, rows, baseRows, true);
+  // Also initialize wrappers over independently loaded lazy bases.
+  vector->loadedVector();
 }
 
 void LazyVector::validate(const VectorValidateOptions& options) const {

@@ -395,6 +395,14 @@ class LazyVector : public BaseVector {
       const VectorPtr& vector,
       const SelectivityVector& rows);
 
+  /// Materializes selected rows including all nested container children.
+  /// Unlike expression-time loading, this also loads FlatMap value channels,
+  /// preserving outer selections, map nulls, and per-key presence masks. Use
+  /// before retaining a complete value beyond its backing reader's lifetime.
+  static void ensureLoadedRowsRecursively(
+      const VectorPtr& vector,
+      const SelectivityVector& rows);
+
   // as ensureLoadedRows, above, but takes a scratch DecodedVector and
   // SelectivityVector as arguments to enable reuse.
   static void ensureLoadedRows(
@@ -423,7 +431,8 @@ class LazyVector : public BaseVector {
       const VectorPtr& vector,
       DecodedVector& decoded,
       const SelectivityVector& rows,
-      SelectivityVector& baseRows);
+      SelectivityVector& baseRows,
+      bool loadAllChildren = false);
 
   void loadVectorInternal() const;
 

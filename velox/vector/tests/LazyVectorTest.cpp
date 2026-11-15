@@ -19,6 +19,8 @@
 #include "velox/common/base/ConcurrentRuntimeStatWriter.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/RawVector.h"
+#include "velox/vector/FlatMapVector.h"
+#include "velox/vector/SequenceVector.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 namespace facebook::velox {
@@ -32,6 +34,324 @@ class LazyVectorTest : public testing::Test, public VectorTestBase {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 };
+
+TEST_F(LazyVectorTest, partialRowWithLazyChild) {
+  std::vector<vector_size_t> loaded;
+  auto lazy = std::make_shared<LazyVector>(
+      pool(),
+      BIGINT(),
+      8,
+      std::make_unique<SimpleVectorLoader>([&](RowSet rows) {
+        loaded.assign(rows.begin(), rows.end());
+        return makeFlatVector<int64_t>(8, [](auto i) { return i; });
+      }));
+  auto row = std::make_shared<RowVector>(
+      pool(),
+      ROW({"unused0", "v", "unused1"}, {BIGINT(), BIGINT(), BIGINT()}),
+      makeNulls(8, [](auto i) { return i == 3; }),
+      8,
+      std::vector<VectorPtr>{nullptr, lazy, nullptr});
+  SelectivityVector rows(8, false);
+  for (auto i : {1, 3, 5}) {
+    rows.setValid(i, true);
+  }
+  rows.updateBounds();
+  LazyVector::ensureLoadedRows(row, rows);
+  EXPECT_EQ(loaded, (std::vector<vector_size_t>{1, 5}));
+  EXPECT_EQ(row->childAt(0), nullptr);
+  EXPECT_EQ(row->childAt(2), nullptr);
+  EXPECT_FALSE(isLazyNotLoaded(*row));
+  EXPECT_EQ(row->childAt(1)->asFlatVector<int64_t>()->valueAt(5), 5);
+}
+
+TEST_F(LazyVectorTest, selectedFlatMapChildren) {
+  // Exercise multiple channels, absent keys, null maps, wrapper selections,
+  // and partial ROW values containing lazy children.
+  for (bool rowValues : {false, true}) {
+    for (int wrapper = 0; wrapper < 3; ++wrapper) {
+      SCOPED_TRACE(fmt::format("rows={}, wrapper={}", rowValues, wrapper));
+      std::vector<vector_size_t> loaded[3];
+      std::vector<VectorPtr> values;
+      std::vector<FlatVectorPtr<int64_t>> payloads;
+      for (int channel = 0; channel < 3; ++channel) {
+        auto payload = makeFlatVector<int64_t>(
+            8, [channel](auto i) { return 100 * channel + i; });
+        payloads.push_back(payload);
+        auto lazy = std::make_shared<LazyVector>(
+            pool(),
+            BIGINT(),
+            8,
+            std::make_unique<SimpleVectorLoader>(
+                [&, channel, payload](RowSet rows) {
+                  loaded[channel].assign(rows.begin(), rows.end());
+                  return payload;
+                }));
+        values.push_back(
+            rowValues ? VectorPtr(std::make_shared<RowVector>(
+                            pool(),
+                            ROW({"v", "unused"}, {BIGINT(), BIGINT()}),
+                            nullptr,
+                            8,
+                            std::vector<VectorPtr>{lazy, nullptr}))
+                      : VectorPtr(lazy));
+      }
+      auto map = std::make_shared<FlatMapVector>(
+          pool(),
+          MAP(BIGINT(), values[0]->type()),
+          makeNulls(8, [](auto i) { return i == 3; }),
+          8,
+          makeFlatVector<int64_t>({1, 2, 3}),
+          values,
+          std::vector<BufferPtr>{
+              makeNulls(8, [](auto i) { return i % 2 == 0; }),
+              makeNulls(8, [](auto i) { return i % 2 != 0; }),
+              makeNulls(8, [](auto) { return true; })});
+      VectorPtr wrapped = map;
+      if (wrapper == 1) {
+        wrapped = BaseVector::wrapInDictionary(
+            makeNulls(5, [](auto i) { return i == 0; }),
+            makeIndices({7, 0, 3, 5, 1}),
+            5,
+            map);
+      } else if (wrapper == 2) {
+        wrapped = BaseVector::wrapInConstant(4, 5, map);
+      }
+      SelectivityVector rows(wrapped->size());
+      if (wrapper == 0) {
+        rows.setValid(2, false);
+        rows.setValid(4, false);
+        rows.setValid(6, false);
+        rows.updateBounds();
+      }
+      LazyVector::ensureLoadedRowsRecursively(wrapped, rows);
+      EXPECT_FALSE(isLazyNotLoaded(*wrapped));
+      EXPECT_EQ(
+          loaded[0],
+          wrapper == 0       ? (std::vector<vector_size_t>{1, 5, 7})
+              : wrapper == 1 ? (std::vector<vector_size_t>{1, 5})
+                             : (std::vector<vector_size_t>{5}));
+      EXPECT_EQ(
+          loaded[1],
+          wrapper == 2 ? std::vector<vector_size_t>{}
+                       : (std::vector<vector_size_t>{0}));
+      EXPECT_TRUE(loaded[2].empty());
+      // Loading did not copy the value payloads.
+      const auto& first = map->mapValuesAt(0);
+      EXPECT_EQ(
+          rowValues ? first->as<RowVector>()->childAt(0)
+                    : BaseVector::loadedVectorShared(first),
+          payloads[0]);
+      // Ordinary loadedVector/decode calls must neither recurse forever nor
+      // reload rows omitted by the earlier selection.
+      EXPECT_EQ(map->loadedVector(), map.get());
+      DecodedVector decoded(*wrapped, rows);
+      EXPECT_EQ(decoded.base(), map.get());
+    }
+  }
+}
+
+TEST_F(LazyVectorTest, fullyLoadedFlatMap) {
+  std::vector<vector_size_t> loaded;
+  auto lazy = std::make_shared<LazyVector>(
+      pool(),
+      BIGINT(),
+      8,
+      std::make_unique<SimpleVectorLoader>([&](RowSet rows) {
+        loaded.assign(rows.begin(), rows.end());
+        return makeFlatVector<int64_t>(8, [](auto i) { return i; });
+      }));
+  auto map = std::make_shared<FlatMapVector>(
+      pool(),
+      MAP(BIGINT(), BIGINT()),
+      makeNulls(8, [](auto i) { return i == 3; }),
+      8,
+      makeFlatVector<int64_t>({1}),
+      std::vector<VectorPtr>{lazy},
+      std::vector<BufferPtr>{makeNulls(8, [](auto i) { return i % 2 == 0; })});
+  LazyVector::ensureLoadedRowsRecursively(map, SelectivityVector(map->size()));
+  DecodedVector decoded(*map);
+  EXPECT_EQ(decoded.base(), map.get());
+  EXPECT_EQ(loaded, (std::vector<vector_size_t>{1, 5, 7}));
+  EXPECT_FALSE(isLazyNotLoaded(*map));
+}
+
+TEST_F(LazyVectorTest, recursivelyLoadNestedFlatMap) {
+  for (bool mapContainer : {false, true}) {
+    std::vector<vector_size_t> loaded;
+    auto lazy = std::make_shared<LazyVector>(
+        pool(),
+        BIGINT(),
+        8,
+        std::make_unique<SimpleVectorLoader>([&](RowSet rows) {
+          loaded.assign(rows.begin(), rows.end());
+          return makeFlatVector<int64_t>(8, [](auto i) { return i; });
+        }));
+    auto flatMap = std::make_shared<FlatMapVector>(
+        pool(),
+        MAP(BIGINT(), BIGINT()),
+        nullptr,
+        8,
+        makeFlatVector<int64_t>({1}),
+        std::vector<VectorPtr>{lazy},
+        std::vector<BufferPtr>{
+            makeNulls(8, [](auto i) { return i % 2 == 0; })});
+    VectorPtr container = mapContainer
+        ? VectorPtr(makeMapVector(
+              {0, 2, 4, 6},
+              makeFlatVector<int64_t>(8, [](auto i) { return i; }),
+              flatMap))
+        : VectorPtr(makeArrayVector({0, 2, 4, 6}, flatMap));
+    container->setNull(1, true);
+    auto wrapped = BaseVector::wrapInDictionary(
+        nullptr, makeIndices({1, 3}), 2, container);
+    LazyVector::ensureLoadedRowsRecursively(wrapped, SelectivityVector(2));
+    EXPECT_EQ(loaded, (std::vector<vector_size_t>{7}));
+    EXPECT_TRUE(lazy->isLoaded());
+  }
+}
+
+TEST_F(LazyVectorTest, recursiveEmptyConstantSelection) {
+  auto lazy = std::make_shared<LazyVector>(
+      pool(),
+      BIGINT(),
+      8,
+      std::make_unique<SimpleVectorLoader>([&](RowSet) -> VectorPtr {
+        ADD_FAILURE() << "Excluded constant value was evaluated";
+        return makeFlatVector<int64_t>(8, [](auto i) { return i; });
+      }));
+  auto constant = std::make_shared<ConstantVector<int64_t>>(pool(), 8, 3, lazy);
+  auto map = std::make_shared<FlatMapVector>(
+      pool(),
+      MAP(BIGINT(), BIGINT()),
+      nullptr,
+      8,
+      makeFlatVector<int64_t>({1}),
+      std::vector<VectorPtr>{constant},
+      std::vector<BufferPtr>{makeNulls(8, [](auto) { return true; })});
+  LazyVector::ensureLoadedRowsRecursively(map, SelectivityVector(8));
+  EXPECT_TRUE(lazy->isLoaded());
+  EXPECT_TRUE(constant->isNullAt(0));
+}
+TEST_F(LazyVectorTest, recursiveSequenceSelections) {
+  for (int wrapper = 0; wrapper < 5; ++wrapper) {
+    SCOPED_TRACE(wrapper);
+    std::vector<vector_size_t> loaded;
+    auto payload = makeFlatVector<int64_t>({10, 20, 30, 40});
+    auto lazy = std::make_shared<LazyVector>(
+        pool(),
+        BIGINT(),
+        4,
+        std::make_unique<SimpleVectorLoader>([&](RowSet rows) {
+          loaded.assign(rows.begin(), rows.end());
+          return payload;
+        }));
+    auto values = std::make_shared<RowVector>(
+        pool(),
+        ROW({"v", "unused"}, {BIGINT(), BIGINT()}),
+        makeNulls(4, [](auto i) { return i == 1; }),
+        4,
+        std::vector<VectorPtr>{lazy, nullptr});
+    auto lengths = makeIndices({2, 3, 1, 2});
+    VectorPtr vector = std::make_shared<SequenceVector<ComplexType>>(
+        pool(), 8, values, lengths);
+    if (wrapper == 1) {
+      vector = BaseVector::wrapInDictionary(
+          makeNulls(5, [](auto i) { return i == 0; }),
+          makeIndices({7, 0, 3, 4, 6}),
+          5,
+          vector);
+    } else if (wrapper == 2 || wrapper == 3) {
+      vector = std::make_shared<ConstantVector<ComplexType>>(
+          pool(), 3, wrapper == 2 ? 6 : 4, vector);
+    } else if (wrapper == 4) {
+      auto sequence = vector;
+      vector = std::make_shared<LazyVector>(
+          pool(),
+          sequence->type(),
+          8,
+          std::make_unique<SimpleVectorLoader>(
+              [sequence](RowSet) { return sequence; }));
+    }
+    SelectivityVector rows(vector->size());
+    if (wrapper == 0 || wrapper == 4) {
+      rows.clearAll();
+      for (auto row : {0, 3, 7}) {
+        rows.setValid(row, true);
+      }
+      rows.updateBounds();
+    }
+    LazyVector::ensureLoadedRowsRecursively(vector, rows);
+    EXPECT_EQ(
+        loaded,
+        wrapper == 3       ? std::vector<vector_size_t>{}
+            : wrapper == 2 ? std::vector<vector_size_t>{3}
+                           : (std::vector<vector_size_t>{0, 3}));
+    EXPECT_TRUE(lazy->isLoaded());
+    EXPECT_EQ(values->childAt(1), nullptr);
+    if (wrapper != 3) {
+      EXPECT_EQ(values->childAt(0), payload);
+    }
+  }
+}
+
+TEST_F(LazyVectorTest, recursiveLoadedContainers) {
+  // Large logical backing storage in a scalar constant needs no element bitmap.
+  auto scalar =
+      BaseVector::wrapInConstant(1 << 24, 0, makeFlatVector<int64_t>({7}));
+  auto array = makeArrayVector({0, 1 << 23}, scalar);
+  auto map = makeMapVector({0, 1 << 23}, scalar, scalar);
+  for (const VectorPtr& vector : {VectorPtr(array), VectorPtr(map)}) {
+    LazyVector::ensureLoadedRowsRecursively(vector, SelectivityVector(2));
+  }
+  EXPECT_EQ(array->elements(), scalar);
+  EXPECT_EQ(map->mapKeys(), scalar);
+  EXPECT_EQ(map->mapValues(), scalar);
+}
+
+TEST_F(LazyVectorTest, recursiveInitializesLoadedDescendants) {
+  for (int container = 0; container < 3; ++container) {
+    for (bool nullValue : {false, true}) {
+      SCOPED_TRACE(fmt::format("container={}, null={}", container, nullValue));
+      auto lazy = std::make_shared<LazyVector>(
+          pool(),
+          BIGINT(),
+          4,
+          std::make_unique<SimpleVectorLoader>([&](RowSet) {
+            return makeNullableFlatVector<int64_t>(
+                {10,
+                 20,
+                 nullValue ? std::nullopt : std::optional<int64_t>(30),
+                 40});
+          }));
+      auto constant =
+          std::make_shared<ConstantVector<int64_t>>(pool(), 4, 2, lazy);
+      // Loading the base directly leaves its existing wrapper uninitialized.
+      LazyVector::ensureLoadedRows(lazy, SelectivityVector(4));
+      VectorPtr vector;
+      if (container == 0) {
+        vector = makeArrayVector({0, 2}, constant);
+      } else if (container == 1) {
+        vector = makeMapVector(
+            {0, 2}, makeFlatVector<int64_t>({1, 2, 3, 4}), constant);
+      } else {
+        vector = std::make_shared<FlatMapVector>(
+            pool(),
+            MAP(BIGINT(), BIGINT()),
+            nullptr,
+            4,
+            makeFlatVector<int64_t>({1}),
+            std::vector<VectorPtr>{constant},
+            std::vector<BufferPtr>{});
+      }
+      LazyVector::ensureLoadedRowsRecursively(
+          vector, SelectivityVector(vector->size()));
+      EXPECT_EQ(constant->isNullAt(0), nullValue);
+      if (!nullValue) {
+        EXPECT_EQ(constant->valueAt(0), 30);
+      }
+    }
+  }
+}
 
 TEST_F(LazyVectorTest, lazyInDictionary) {
   // We have a dictionary over LazyVector. We load for some indices in
