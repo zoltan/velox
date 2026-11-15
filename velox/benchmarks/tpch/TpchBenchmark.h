@@ -31,11 +31,20 @@ class TpchBenchmark : public facebook::velox::QueryBenchmarkBase {
     run(planContext, queryConfigs_);
   }
 
+  void runCteQuery(
+      int32_t queryId,
+      const facebook::velox::exec::CteOptions& options) {
+    const auto plan = queryBuilder_->getCtePlan(queryId, true, options);
+    auto result = run(plan, queryConfigs_);
+    VELOX_CHECK_NOT_NULL(result.first, "CTE query failed");
+  }
+
  protected:
   std::unordered_map<std::string, std::string> queryConfigs_;
 
  private:
   void initQueryBuilder();
+  void compareCtePlans(std::ostream& out);
 
   std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder> queryBuilder_;
 };
