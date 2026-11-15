@@ -246,6 +246,14 @@ TEST_F(EvalCtxTest, computeInputFlatNoNulls) {
   });
   ASSERT_TRUE(EvalCtx::computeInputFlatNoNulls(*flat));
 
+  // Missing fields in a partial ROW disable the fast path, regardless of slot.
+  for (auto channel : {0, 1}) {
+    auto partial = std::make_shared<RowVector>(
+        pool(), flat->type(), nullptr, flat->size(), flat->children());
+    partial->childAt(channel).reset();
+    EXPECT_FALSE(EvalCtx::computeInputFlatNoNulls(*partial));
+  }
+
   // Flat with nulls -> false.
   auto withNulls = makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3}),

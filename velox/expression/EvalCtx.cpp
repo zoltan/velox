@@ -65,7 +65,10 @@ EvalCtx::EvalCtx(
 // static
 bool EvalCtx::computeInputFlatNoNulls(const RowVector& row) {
   for (const auto& child : row.children()) {
-    VELOX_CHECK_NOT_NULL(child);
+    // Selective readers may omit fields that the expression does not use.
+    if (!child) {
+      return false;
+    }
     if ((!child->isFlatEncoding() && !child->isConstantEncoding()) ||
         child->mayHaveNulls()) {
       return false;
