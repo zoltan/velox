@@ -381,3 +381,20 @@ velox_add_cudf_test(
   SOURCES Main.cpp CudfMemoryResourceTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS}
 )
+
+# These failure regressions require the cuDF accepted-read completion fix.
+# The pinned upstream cuDF does not contain it yet.
+option(VELOX_CUDF_TEST_READ_COMPLETION_FIX "Test patched cuDF read completion" OFF)
+if(VELOX_CUDF_TEST_READ_COMPLETION_FIX)
+  # Keep the copy interposition shim isolated from other GPU tests.
+  velox_add_cudf_test(
+    NAME velox_cudf_read_failure_test
+    SOURCES CudfReadFailureTest.cpp
+    LIBS cudf::cudf
+  )
+  velox_add_cudf_test(
+    NAME velox_cudf_copy_failure_test
+    SOURCES CudfCopyFailureTest.cpp
+    LIBS CUDA::cudart cudf::cudf
+  )
+endif()
