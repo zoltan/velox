@@ -46,7 +46,8 @@ CudfBackend& cudfBackend() {
 } // namespace
 
 std::shared_ptr<memory::CustomMemoryResource> createCudfCustomMemoryResource(
-    int64_t capacity) {
+    int64_t capacity,
+    bool reclaimDiscardableMemory) {
   VELOX_USER_CHECK_GT(capacity, 0, "GPU memory capacity must be positive");
 
   // GPU bytes are allocated by RMM and charged through
@@ -84,6 +85,9 @@ std::shared_ptr<memory::CustomMemoryResource> createCudfCustomMemoryResource(
                memory::SharedArbitrator::ExtraConfig::
                    kMemoryPoolMinFreeCapacityPct),
            "0"}}};
+  arbitratorConfig.extraConfigs[std::string(
+      memory::SharedArbitrator::ExtraConfig::kBoundedDiscardableReclaim)] =
+      reclaimDiscardableMemory ? "true" : "false";
   auto arbitrator =
       std::make_shared<memory::SharedArbitrator>(arbitratorConfig);
 

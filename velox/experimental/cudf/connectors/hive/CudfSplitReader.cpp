@@ -716,8 +716,12 @@ void CudfSplitReader::setupCudfDataSource() {
     makeKvikioDataSource();
     return;
   }
-  dataSource_ =
-      std::make_shared<BufferedInputDataSource>(std::move(bufferedInput));
+  dataSource_ = std::make_shared<BufferedInputDataSource>(
+      std::move(bufferedInput),
+      ioStats_,
+      baseReaderOpts_.cacheable()
+          ? std::make_shared<StringIdLease>(fileHandleCachePtr->uuid)
+          : nullptr);
 }
 
 void CudfSplitReader::setupReaderOptions() {

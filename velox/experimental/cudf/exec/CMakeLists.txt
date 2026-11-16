@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Shared by readers and operators; keep cache ownership below both layers.
+add_library(
+  velox_cudf_memory
+  CudfMemoryArbitration.cpp
+  CudfMemoryResource.cpp
+  GpuResources.cpp
+  GpuEncodedCache.cpp
+  EncodedInputGpuCache.cpp
+  ../io/CachedDeviceRead.cpp
+)
+target_link_libraries(
+  velox_cudf_memory
+  PUBLIC cudf::cudf nvtx3::nvtx3-cpp velox_gpu_device_input
+  PRIVATE velox_memory velox_exec
+)
+
 add_library(
   velox_cudf_exec
   AggregationRegistry.cpp
@@ -31,8 +47,6 @@ add_library(
   CudfLocalMerge.cpp
   CudfLocalPartition.cpp
   CudfMarkDistinct.cpp
-  CudfMemoryArbitration.cpp
-  CudfMemoryResource.cpp
   CudfNestedLoopJoin.cpp
   CudfOperator.cpp
   CudfOrderBy.cpp
@@ -45,7 +59,6 @@ add_library(
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp
   GpuCapabilities.cpp
-  GpuResources.cpp
   OperatorAdapters.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp
@@ -56,7 +69,7 @@ add_library(
 
 target_link_libraries(
   velox_cudf_exec
-  PUBLIC cudf::cudf nvtx3::nvtx3-cpp
+  PUBLIC cudf::cudf nvtx3::nvtx3-cpp velox_cudf_memory
   PRIVATE
     arrow
     velox_arrow_bridge

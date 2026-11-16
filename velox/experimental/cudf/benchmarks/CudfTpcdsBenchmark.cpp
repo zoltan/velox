@@ -21,11 +21,13 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
+#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/tests/utils/CudfTpcdsQueryBuilder.h"
 
 #include "velox/common/caching/AsyncDataCache.h"
+#include "velox/common/memory/CustomMemoryResourceRegistry.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/core/QueryCtx.h"
@@ -57,6 +59,12 @@ DEFINE_uint64(
     gpu_capacity_bytes,
     0,
     "Shared GPU accounting capacity; zero disables accounting.");
+DEFINE_bool(
+    gpu_input_cache,
+    false,
+    "Retain encoded GPU inputs using the shared accounting budget.");
+DEFINE_bool(gpu_cache_profile, false, "Measure GPU cache metadata lock costs.");
+
 DEFINE_bool(
     suite_memory,
     false,
@@ -111,7 +119,17 @@ void CudfTpcdsBenchmark::initialize() {
   }
 
   TpcdsBenchmark::initialize();
+  VELOX_CHECK(!FLAGS_gpu_input_cache || FLAGS_gpu_capacity_bytes > 0);
   if (FLAGS_gpu_capacity_bytes > 0) {
+    if (FLAGS_gpu_input_cache) {
+      auto resource = cudf_velox::createCudfCustomMemoryResource(
+          FLAGS_gpu_capacity_bytes, true);
+      memory::CustomMemoryResourceRegistry::global().insert(
+          std::string{cudf_velox::kCudfMemoryResourceTag}, resource);
+      deviceCache_ = std::make_shared<cudf_velox::GpuEncodedCache>(
+          resource, *cudf_velox::mr_, FLAGS_gpu_cache_profile);
+      cudf_velox::setEncodedInputGpuCache(deviceCache_);
+    }
     cudf_velox::registerCudfMemoryResource(FLAGS_gpu_capacity_bytes);
     queryExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(
         std::max(1, FLAGS_num_drivers));
@@ -157,6 +175,8 @@ CudfTpcdsBenchmark::makeConnectorProperties() {
 }
 
 void CudfTpcdsBenchmark::shutdown() {
+  cudf_velox::setEncodedInputGpuCache(nullptr);
+  deviceCache_.reset();
   // CudfTpcdsQueryBuilder::shutdown() handles unregisterCudf().
   TpcdsBenchmark::shutdown();
 }
@@ -231,6 +251,9 @@ void CudfTpcdsBenchmark::runSequence() {
             metrics[name] = metrics[name].asInt() + metric.sum;
           }
         }
+      }
+      if (deviceCache_) {
+        record["gpu_cache"] = deviceCache_->snapshot();
       }
       record["raw_input_bytes"] = rawInputBytes;
       record["runtime_metrics"] = std::move(metrics);

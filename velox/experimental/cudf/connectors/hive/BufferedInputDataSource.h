@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
 #include "velox/experimental/gpu/DeviceReadSource.h"
 
+#include "velox/common/caching/StringIdMap.h"
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/io/datasource.hpp>
@@ -39,7 +41,9 @@ class BufferedInputDataSource
       public std::enable_shared_from_this<BufferedInputDataSource> {
  public:
   explicit BufferedInputDataSource(
-      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input);
+      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
+      std::shared_ptr<IoStats> ioStats = nullptr,
+      std::shared_ptr<const StringIdLease> fileIdentity = nullptr);
 
   [[nodiscard]] size_t size() const override;
 
@@ -73,8 +77,22 @@ class BufferedInputDataSource
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
+  // Return leased cache input, using the existing batched copy for bypasses.
+  gpu::DeviceReadBatch readCachedRanges(
+      std::span<const gpu::DeviceByteRange> ranges,
+      bool serializeSubmissions,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref outputResource,
+      rmm::device_async_resource_ref temporaryResource);
+
+  void recordBytes(const char* name, uint64_t bytes);
+
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
+  std::shared_ptr<IoStats> ioStats_;
+  // Keep the immutable file generation alive even when host bytes are evicted.
+  std::shared_ptr<const StringIdLease> fileIdentity_;
+  std::shared_ptr<GpuEncodedCache> deviceCache_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

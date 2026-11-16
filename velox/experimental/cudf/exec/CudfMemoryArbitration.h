@@ -33,10 +33,13 @@ inline constexpr std::string_view kCudfMemoryResourceTag{"gpu"};
 /// roots. The SharedArbitrator first transfers unused capacity and then asks
 /// reclaimable query roots to spill used device memory.
 /// Capacity is a logical GPU budget in bytes, independent of RMM pool sizing.
+/// With reclaimDiscardableMemory, prefer discardable caches before spilling
+/// operators and admit cache fills only from spare capacity.
 /// The caller must retain an unregistered resource until all its pools are
 /// gone.
 std::shared_ptr<memory::CustomMemoryResource> createCudfCustomMemoryResource(
-    int64_t capacity);
+    int64_t capacity,
+    bool reclaimDiscardableMemory = false);
 
 /// Installs one process-wide GPU resource in the global custom-resource
 /// registry and retains it for the process lifetime, including after

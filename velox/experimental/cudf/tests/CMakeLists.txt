@@ -398,3 +398,9 @@ if(VELOX_CUDF_TEST_READ_COMPLETION_FIX)
     LIBS CUDA::cudart cudf::cudf
   )
 endif()
+
+velox_add_cudf_test(
+  NAME velox_cudf_gpu_input_cache_test
+  SOURCES Main.cpp GpuInputCacheTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_cudf_hive_connector
+)
