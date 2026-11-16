@@ -139,7 +139,16 @@ TEST_F(GpuInputCacheTest, ShardedCacheCoalescesConcurrentFill) {
   EXPECT_EQ(cache->evict(0), 8L << 20);
 }
 
-TEST_F(GpuInputCacheTest, coalescedFillAllowsTaskPause) {
+enum class FillInterruption {
+  kPause,
+  kCancelBeforeWait,
+  kCancelWhileWaiting,
+};
+
+// Exercise Task accounting with actual allocation arbitration and driver
+// contexts. Keep the creator gated until the requested interruption is
+// observed.
+void runCoalescedFillInterruption(FillInterruption interruption) {
   for (bool failAllocation : {false, true}) {
     SCOPED_TRACE(failAllocation);
     folly::Baton<> creatorArbitrating;
@@ -180,9 +189,11 @@ TEST_F(GpuInputCacheTest, coalescedFillAllowsTaskPause) {
         0,
         core::QueryCtx::create(&executor),
         exec::Task::ExecutionMode::kParallel);
+    std::array<std::shared_ptr<exec::Driver>, 2> drivers;
     auto runDriver = [&](int id, auto action) {
       auto driver = exec::Driver::testingCreate(
           std::make_unique<exec::DriverCtx>(task, id, 0, 0, 0));
+      drivers[id] = driver;
       driver->state().isEnqueued = true;
       VELOX_CHECK_EQ(task->enter(driver->state()), exec::StopReason::kNone);
       SCOPE_EXIT {
@@ -205,6 +216,11 @@ TEST_F(GpuInputCacheTest, coalescedFillAllowsTaskPause) {
           return static_cast<void*>(nullptr);
         }
         VELOX_CHECK_NOT_NULL(lease);
+        unsigned char byte{0};
+        GpuEncodedCache::check(cudaMemcpyAsync(
+            &byte, lease->data(), 1, cudaMemcpyDeviceToHost, stream.value()));
+        GpuEncodedCache::check(cudaStreamSynchronize(stream.value()));
+        EXPECT_EQ(byte, 0x39);
         auto* address = lease->data();
         lease.reset();
         return address;
@@ -214,6 +230,18 @@ TEST_F(GpuInputCacheTest, coalescedFillAllowsTaskPause) {
       return runDriver(1, [&](rmm::cuda_stream& stream) {
         waiterEntered.post();
         startLookup.wait();
+        if (interruption == FillInterruption::kCancelBeforeWait) {
+          [&] {
+            VELOX_ASSERT_THROW(
+                cache->getOrFill(
+                    "shared",
+                    8L << 20,
+                    stream.value(),
+                    [](void*) { ADD_FAILURE() << "duplicate fill"; }),
+                "Terminate detected when entering suspension");
+          }();
+          return static_cast<void*>(nullptr);
+        }
         auto lease =
             cache->getOrFill("shared", 8L << 20, stream.value(), [](void*) {
               ADD_FAILURE() << "duplicate fill";
@@ -240,18 +268,80 @@ TEST_F(GpuInputCacheTest, coalescedFillAllowsTaskPause) {
     };
     ASSERT_TRUE(creatorArbitrating.try_wait_for(std::chrono::seconds(5)));
     ASSERT_TRUE(waiterEntered.try_wait_for(std::chrono::seconds(5)));
-    auto paused = task->requestPause();
-    finishArbitration.post();
-    startLookup.post();
-    EXPECT_TRUE(std::move(paused).wait(std::chrono::seconds(5)))
-        << "coalesced waiter prevents task pause";
-    // Resume even on failure so the broken control terminates cleanly.
-    exec::Task::resume(task);
-    EXPECT_EQ(creator.get(), waiter.get());
+    if (interruption == FillInterruption::kPause) {
+      auto paused = task->requestPause();
+      finishArbitration.post();
+      startLookup.post();
+      EXPECT_TRUE(std::move(paused).wait(std::chrono::seconds(5)))
+          << "coalesced waiter prevents task pause";
+      // Resume even on failure so the broken control terminates cleanly.
+      exec::Task::resume(task);
+      EXPECT_EQ(creator.get(), waiter.get());
+    } else {
+      if (interruption == FillInterruption::kCancelWhileWaiting) {
+        startLookup.post();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!drivers[1]->state().suspended() &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        ASSERT_TRUE(drivers[1]->state().suspended());
+        EXPECT_EQ(cache->snapshot()["coalesced_fills"].asInt(), 1);
+      }
+      auto canceled = task->requestCancel();
+      startLookup.post();
+      EXPECT_TRUE(std::move(canceled).wait(std::chrono::seconds(5)))
+          << "cancellation acknowledgment depends on the pending fill";
+      EXPECT_EQ(task->state(), exec::TaskState::kCanceled);
+      EXPECT_EQ(cache->evict(0), 0);
+      EXPECT_EQ(cache->snapshot()["eligible_bytes"].asInt(), 0);
+      if (interruption == FillInterruption::kCancelBeforeWait) {
+        // Rejected suspension must unwind the waiter before the creator runs.
+        const auto status = waiter.wait_for(std::chrono::seconds(5));
+        EXPECT_EQ(status, std::future_status::ready);
+        if (status != std::future_status::ready) {
+          // Unblock cleanup even if the cancellation contract regresses.
+          finishArbitration.post();
+        }
+        EXPECT_EQ(waiter.get(), nullptr);
+        EXPECT_EQ(drivers[1]->state().numSuspensions.load(), 0);
+        EXPECT_FALSE(drivers[1]->state().isOnThread());
+        finishArbitration.post();
+        EXPECT_EQ(creator.get() == nullptr, failAllocation);
+      } else {
+        // Cancellation acknowledges a suspended driver. Its stack and pin
+        // remain alive until the producer completes or refuses allocation.
+        EXPECT_EQ(
+            waiter.wait_for(std::chrono::seconds(0)),
+            std::future_status::timeout);
+        finishArbitration.post();
+        EXPECT_EQ(creator.get(), waiter.get());
+      }
+      for (const auto& driver : drivers) {
+        EXPECT_EQ(driver->state().numSuspensions.load(), 0);
+        EXPECT_FALSE(driver->state().isOnThread());
+        EXPECT_TRUE(driver->state().isTerminated);
+      }
+    }
     EXPECT_EQ(cache->snapshot()["coalesced_fills"].asInt(), 1);
     EXPECT_EQ(cache->evict(0), failAllocation ? 0 : 8L << 20);
     EXPECT_EQ(cache->pool()->usedBytes(), 0);
+    EXPECT_EQ(cache->snapshot()["eligible_bytes"].asInt(), 0);
+    EXPECT_EQ(cache->snapshot()["pending_free_bytes"].asInt(), 0);
   }
+}
+
+TEST_F(GpuInputCacheTest, coalescedFillAllowsTaskPause) {
+  runCoalescedFillInterruption(FillInterruption::kPause);
+}
+
+TEST_F(GpuInputCacheTest, coalescedFillCancelsBeforeSuspension) {
+  runCoalescedFillInterruption(FillInterruption::kCancelBeforeWait);
+}
+
+TEST_F(GpuInputCacheTest, coalescedFillCancelsWhileWaiting) {
+  runCoalescedFillInterruption(FillInterruption::kCancelWhileWaiting);
 }
 
 TEST_F(GpuInputCacheTest, ShardedAdmissionBypassesWithoutSpilling) {
