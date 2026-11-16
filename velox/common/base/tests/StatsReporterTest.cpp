@@ -392,6 +392,14 @@ class TestMemoryPool : public memory::MemoryPool {
   }
 };
 
+TEST_F(StatsReporterTest, unsupportedArbitrationHooks) {
+  // Existing subclasses remain concrete without implementing this capability.
+  TestMemoryPool pool;
+  VELOX_ASSERT_THROW(
+      pool.setArbitrationHooks({nullptr, nullptr}),
+      "does not support arbitration hooks");
+}
+
 TEST_F(PeriodicStatsReporterTest, basic) {
   TestStatsReportMmapAllocator allocator(1, 1, 1, 1);
   TestStatsReportAsyncDataCache cache(
