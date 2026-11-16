@@ -18,6 +18,8 @@
 
 #include "velox/benchmarks/tpcds/TpcdsBenchmark.h"
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -35,7 +37,17 @@ class CudfTpcdsBenchmark : public TpcdsBenchmark {
 
   void shutdown() override;
 
+  /// Run saved plans in order, retaining the process caches between queries.
+  void runSequence();
+
  protected:
   /// Creates CudfTpcdsQueryBuilder and calls enableCudf().
   void initQueryBuilder() override;
+
+  void prepareCursorParameters(
+      facebook::velox::exec::CursorParameters& params) override;
+
+ private:
+  // Outlives all query contexts created by the sequence harness.
+  std::unique_ptr<folly::CPUThreadPoolExecutor> queryExecutor_;
 };

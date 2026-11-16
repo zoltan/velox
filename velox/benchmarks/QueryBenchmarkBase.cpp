@@ -304,6 +304,7 @@ QueryBenchmarkBase::run(
       for (const auto& [key, value] : config_) {
         params.queryConfigs[key] = value;
       }
+      prepareCursorParameters(params);
       const int numSplitsPerFile = FLAGS_num_splits_per_file;
 
       auto addSplits = [&](TaskCursor* taskCursor) {

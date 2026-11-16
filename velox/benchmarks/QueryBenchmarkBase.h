@@ -85,6 +85,9 @@ class QueryBenchmarkBase {
   virtual std::shared_ptr<config::ConfigBase> makeConnectorProperties();
 
  protected:
+  // Configure query-owned resources before the cursor creates its task.
+  virtual void prepareCursorParameters(exec::CursorParameters& params) {}
+
   std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
   std::unique_ptr<folly::IOThreadPoolExecutor> cacheExecutor_;
   std::shared_ptr<memory::MemoryAllocator> allocator_;
