@@ -24,6 +24,7 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/config/Config.h"
+#include "velox/common/memory/DiscardableMemoryReclaimer.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
@@ -223,6 +224,11 @@ SharedArbitrator::SharedArbitrator(const Config& config)
           ExtraConfig::memoryPoolMinReclaimPct(config.extraConfigs)),
       memoryReclaimThreadsHwMultiplier_(
           ExtraConfig::memoryReclaimThreadsHwMultiplier(config.extraConfigs)),
+      boundedDiscardableReclaim_(
+          getConfig<bool>(
+              config.extraConfigs,
+              ExtraConfig::kBoundedDiscardableReclaim,
+              false)),
       globalArbitrationEnabled_(
           ExtraConfig::globalArbitrationEnabled(config.extraConfigs)),
       globalArbitrationMemoryReclaimPct_(
@@ -853,6 +859,27 @@ void SharedArbitrator::growCapacity(ArbitrationOperation& op) {
     return;
   }
 
+  if (boundedDiscardableReclaim_ &&
+      dynamic_cast<DiscardableMemoryReclaimer*>(
+          op.participant()->pool()->reclaimer()) != nullptr) {
+    // Cache admission uses idle capacity without reclaiming live state.
+    // Check the growth precondition before constructing arbitration targets.
+    if (!op.participant()->checkCapacityGrowth(op.requestBytes())) {
+      VELOX_MEM_POOL_CAP_EXCEEDED(
+          "No participant capacity for disposable cache admission");
+    }
+    op.setGrowTargets();
+    if (growWithFreeCapacity(op)) {
+      return;
+    }
+    reclaimUnusedCapacity();
+    if (growWithFreeCapacity(op)) {
+      return;
+    }
+    VELOX_MEM_POOL_CAP_EXCEEDED(
+        "No idle capacity for disposable cache admission");
+  }
+
   if (!ensureCapacity(op)) {
     const auto maxCapacity = op.participant()->maxCapacity();
     VELOX_MEM_POOL_CAP_EXCEEDED(
@@ -1073,21 +1100,31 @@ void SharedArbitrator::runGlobalArbitration() {
         break;
       }
 
-      // Check if we need to abort participant to reclaim used memory to
-      // accelerate global arbitration.
-      shouldReclaimByAbort = globalArbitrationShouldReclaimByAbort(
-          arbitrationWatch.elapsed().count(),
-          shouldReclaimByAbort,
-          allParticipantsReclaimed,
-          reclaimedBytes);
-      if (shouldReclaimByAbort) {
-        reclaimedBytes = reclaimUsedMemoryByAbort(/*force=*/true);
+      // Release clean storage before selecting an operator to spill or abort.
+      // A successful round wakes waiters and recomputes their demand.
+      bool madeProgress{false};
+      const auto discardedBytes = boundedDiscardableReclaim_
+          ? reclaimDiscardableMemory(madeProgress)
+          : 0;
+      if (madeProgress) {
+        reclaimedBytes = discardedBytes;
       } else {
-        reclaimedBytes = reclaimUsedMemoryBySpill(
-            targetBytes,
-            reclaimedParticipants,
-            failedParticipants,
-            allParticipantsReclaimed);
+        // Check if we need to abort participant to reclaim used memory to
+        // accelerate global arbitration.
+        shouldReclaimByAbort = globalArbitrationShouldReclaimByAbort(
+            arbitrationWatch.elapsed().count(),
+            shouldReclaimByAbort,
+            allParticipantsReclaimed,
+            reclaimedBytes);
+        if (shouldReclaimByAbort) {
+          reclaimedBytes = reclaimUsedMemoryByAbort(/*force=*/true);
+        } else {
+          reclaimedBytes = reclaimUsedMemoryBySpill(
+              targetBytes,
+              reclaimedParticipants,
+              failedParticipants,
+              allParticipantsReclaimed);
+        }
       }
       totalReclaimedBytes += reclaimedBytes;
       reclaimUnusedCapacity();
@@ -1100,6 +1137,46 @@ void SharedArbitrator::runGlobalArbitration() {
                       << reclaimedParticipants.size() << " victims, spent "
                       << succinctNanos(arbitrationWatch.elapsed().count())
                       << " with " << round << " rounds";
+}
+
+uint64_t SharedArbitrator::reclaimDiscardableMemory(bool& madeProgress) {
+  madeProgress = false;
+  uint64_t reclaimed{0};
+  for (const auto& candidate : getCandidates()) {
+    if (candidate.reclaimableUsedCapacity == 0 ||
+        dynamic_cast<DiscardableMemoryReclaimer*>(
+            candidate.participant->pool()->reclaimer()) == nullptr) {
+      continue;
+    }
+    uint64_t demand{0};
+    {
+      std::lock_guard<std::mutex> lock(stateMutex_);
+      for (const auto& [id, waiter] : globalArbitrationWaiters_) {
+        // Demand beyond the entire resource capacity cannot change this target.
+        demand +=
+            std::min<uint64_t>(waiter->op->requestBytes(), capacity_ - demand);
+      }
+      // Reserved capacity is not available to every waiting participant.
+      demand = demand > freeNonReservedCapacity_
+          ? demand - freeNonReservedCapacity_
+          : 0;
+    }
+    if (demand == 0) {
+      madeProgress = true;
+      break;
+    }
+    // Amortize small growth bursts without the global percentage-based floor.
+    constexpr uint64_t kSlack = 16ULL << 20;
+    bool participantMadeProgress{false};
+    reclaimed += reclaim(
+        candidate.participant,
+        std::min<uint64_t>(candidate.reclaimableUsedCapacity, demand + kSlack),
+        maxArbitrationTimeNs_,
+        /*localArbitration=*/false,
+        &participantMadeProgress);
+    madeProgress |= participantMadeProgress;
+  }
+  return reclaimed;
 }
 
 uint64_t SharedArbitrator::getGlobalArbitrationTarget() {
@@ -1384,13 +1461,19 @@ uint64_t SharedArbitrator::reclaim(
     const ScopedArbitrationParticipant& participant,
     uint64_t targetBytes,
     uint64_t timeoutNs,
-    bool localArbitration) noexcept {
+    bool localArbitration,
+    bool* madeProgress) noexcept {
   uint64_t reclaimTimeNs{0};
   uint64_t reclaimedBytes{0};
   MemoryReclaimer::Stats stats;
   {
     NanosecondWallTimer reclaimTimer(&reclaimTimeNs);
     reclaimedBytes = participant->reclaim(targetBytes, timeoutNs, stats);
+  }
+  if (madeProgress != nullptr) {
+    // A concurrent allocator can shrink the freed reservation before this
+    // participant does. Reclaimer statistics still record the released storage.
+    *madeProgress = reclaimedBytes != 0 || stats.reclaimedBytes != 0;
   }
   // NOTE: if memory reclaim fails, then the participant is also aborted. If
   // it happens, we shall first fail the arbitration operation from the

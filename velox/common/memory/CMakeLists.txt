@@ -42,6 +42,7 @@ velox_add_library(
   ByteStream.h
   CompactDoubleList.h
   CustomMemoryResource.h
+  DiscardableMemoryReclaimer.h
   HashStringAllocator.h
   MallocAllocator.h
   Memory.h

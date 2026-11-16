@@ -76,3 +76,11 @@ if(VELOX_ENABLE_BENCHMARKS)
 endif()
 
 velox_add_library(velox_memory_test_util INTERFACE HEADERS SharedArbitratorTestUtil.h)
+
+add_executable(velox_discardable_memory_test DiscardableMemoryReclaimerTest.cpp)
+target_link_libraries(
+  velox_discardable_memory_test
+  PRIVATE velox_memory velox_test_util GTest::gmock GTest::gtest GTest::gtest_main
+)
+add_test(NAME velox_discardable_memory_test COMMAND velox_discardable_memory_test)
+set_tests_properties(velox_discardable_memory_test PROPERTIES TIMEOUT 120)

@@ -52,6 +52,12 @@ class SharedArbitratorTestHelper;
 class SharedArbitrator : public memory::MemoryArbitrator {
  public:
   struct ExtraConfig {
+    /// Prefer discarding reconstructible cache storage before spilling or
+    /// aborting operators. Cache admission uses only available capacity.
+    /// Defaults to false.
+    static constexpr std::string_view kBoundedDiscardableReclaim{
+        "bounded-discardable-reclaim"};
+
     /// The memory capacity reserved to ensure each running query has minimal
     /// capacity of 'memoryPoolReservedCapacity' to run.
     static constexpr std::string_view kReservedCapacity{"reserved-capacity"};
@@ -426,6 +432,12 @@ class SharedArbitrator : public memory::MemoryArbitrator {
   // Invoked to get the global arbitration target in bytes.
   uint64_t getGlobalArbitrationTarget();
 
+  // Reclaims clean cache storage toward current waiter demand, with fixed
+  // slack for small growth bursts. Recomputes demand before each participant.
+  // Sets 'madeProgress' if reclamation or satisfied demand warrants another
+  // cache-first round, including capacity returned by a concurrent allocator.
+  uint64_t reclaimDiscardableMemory(bool& madeProgress);
+
   // Invoked to run global arbitration to reclaim free or used memory from other
   // queries. The global arbitration run is protected by the exclusive lock of
   // 'arbitrationLock_' for serial execution mode. The function throws on
@@ -547,12 +559,14 @@ class SharedArbitrator : public memory::MemoryArbitrator {
   // Invoked to reclaim used memory from 'participant' with specified
   // 'targetBytes'. The function returns the actually freed capacity.
   // 'localArbitration' is true when the reclaim attempt is for a local
-  // arbitration.
+  // arbitration. If provided, 'madeProgress' includes storage freed by the
+  // callback whose capacity another allocator already returned.
   uint64_t reclaim(
       const ScopedArbitrationParticipant& participant,
       uint64_t targetBytes,
       uint64_t timeoutNs,
-      bool localArbitration) noexcept;
+      bool localArbitration,
+      bool* madeProgress = nullptr) noexcept;
 
   uint64_t shrink(
       const ScopedArbitrationParticipant& participant,
@@ -636,6 +650,7 @@ class SharedArbitrator : public memory::MemoryArbitrator {
   const uint64_t maxArbitrationTimeNs_;
   const ArbitrationParticipant::Config participantConfig_;
   const double memoryReclaimThreadsHwMultiplier_;
+  const bool boundedDiscardableReclaim_;
   const bool globalArbitrationEnabled_;
   const uint32_t globalArbitrationMemoryReclaimPct_;
   const double globalArbitrationAbortTimeRatio_;
