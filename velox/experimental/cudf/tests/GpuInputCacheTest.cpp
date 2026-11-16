@@ -20,12 +20,19 @@
 #include "velox/experimental/cudf/io/CachedDeviceRead.h"
 
 #include "velox/common/file/File.h"
+#include "velox/common/memory/SharedArbitrator.h"
+#include "velox/core/QueryCtx.h"
+#include "velox/exec/Driver.h"
+#include "velox/exec/MemoryReclaimer.h"
+#include "velox/exec/Task.h"
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
 #include <folly/ScopeGuard.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/InlineExecutor.h>
+#include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -129,6 +136,121 @@ TEST_F(GpuInputCacheTest, ShardedCacheCoalescesConcurrentFill) {
   EXPECT_EQ(creator.get(), waiter.get());
   EXPECT_EQ(cache->snapshot()["misses"].asInt(), 1);
   EXPECT_EQ(cache->evict(0), 8L << 20);
+}
+
+TEST_F(GpuInputCacheTest, coalescedFillAllowsTaskPause) {
+  for (bool failAllocation : {false, true}) {
+    SCOPED_TRACE(failAllocation);
+    folly::Baton<> creatorArbitrating;
+    folly::Baton<> finishArbitration;
+    folly::Baton<> waiterEntered;
+    folly::Baton<> startLookup;
+    auto prototype = createCudfCustomMemoryResource(128L << 20, true);
+    auto config = prototype->arbitrator()->config();
+    config.arbitrationStateCheckCb = [&](memory::MemoryPool& pool) {
+      exec::memoryArbitrationStateCheck(pool);
+      creatorArbitrating.post();
+      finishArbitration.wait();
+      if (failAllocation) {
+        throw std::bad_alloc{};
+      }
+    };
+    auto resource = std::make_shared<memory::CustomMemoryResource>(
+        prototype->tag(),
+        std::shared_ptr<memory::MemoryAllocator>(
+            prototype, prototype->allocator()),
+        std::make_shared<memory::SharedArbitrator>(config),
+        [prototype](const memory::ReclaimerContext& context) {
+          return prototype->newReclaimer(context);
+        },
+        prototype->maxCapacity());
+    auto cache = std::make_shared<GpuEncodedCache>(
+        resource, createMemoryResource("cuda", 0));
+    auto pool = memory::memoryManager()->addLeafPool();
+    auto values = std::make_shared<RowVector>(
+        pool.get(), ROW({}), nullptr, 1, std::vector<VectorPtr>{});
+    core::PlanFragment plan;
+    plan.planNode = std::make_shared<core::ValuesNode>(
+        "values", std::vector<RowVectorPtr>{values});
+    folly::CPUThreadPoolExecutor executor(2);
+    auto task = exec::Task::create(
+        "cache-pause",
+        std::move(plan),
+        0,
+        core::QueryCtx::create(&executor),
+        exec::Task::ExecutionMode::kParallel);
+    auto runDriver = [&](int id, auto action) {
+      auto driver = exec::Driver::testingCreate(
+          std::make_unique<exec::DriverCtx>(task, id, 0, 0, 0));
+      driver->state().isEnqueued = true;
+      VELOX_CHECK_EQ(task->enter(driver->state()), exec::StopReason::kNone);
+      SCOPE_EXIT {
+        task->leave(driver->state(), [](exec::StopReason) {});
+      };
+      exec::ScopedDriverThreadContext context(driver->driverCtx());
+      ensureCudaContextForThread();
+      rmm::cuda_stream stream;
+      return action(stream);
+    };
+    auto creator = std::async(std::launch::async, [&] {
+      return runDriver(0, [&](rmm::cuda_stream& stream) {
+        auto lease = cache->getOrFill(
+            "shared", 8L << 20, stream.value(), [&](void* destination) {
+              GpuEncodedCache::check(
+                  cudaMemsetAsync(destination, 0x39, 8L << 20, stream.value()));
+            });
+        if (failAllocation) {
+          EXPECT_FALSE(lease);
+          return static_cast<void*>(nullptr);
+        }
+        VELOX_CHECK_NOT_NULL(lease);
+        auto* address = lease->data();
+        lease.reset();
+        return address;
+      });
+    });
+    auto waiter = std::async(std::launch::async, [&] {
+      return runDriver(1, [&](rmm::cuda_stream& stream) {
+        waiterEntered.post();
+        startLookup.wait();
+        auto lease =
+            cache->getOrFill("shared", 8L << 20, stream.value(), [](void*) {
+              ADD_FAILURE() << "duplicate fill";
+            });
+        if (failAllocation) {
+          EXPECT_FALSE(lease);
+          return static_cast<void*>(nullptr);
+        }
+        VELOX_CHECK_NOT_NULL(lease);
+        unsigned char byte{0};
+        GpuEncodedCache::check(cudaMemcpyAsync(
+            &byte, lease->data(), 1, cudaMemcpyDeviceToHost, stream.value()));
+        GpuEncodedCache::check(cudaStreamSynchronize(stream.value()));
+        EXPECT_EQ(byte, 0x39);
+        auto* address = lease->data();
+        lease.reset();
+        return address;
+      });
+    });
+    SCOPE_EXIT {
+      finishArbitration.post();
+      startLookup.post();
+      exec::Task::resume(task);
+    };
+    ASSERT_TRUE(creatorArbitrating.try_wait_for(std::chrono::seconds(5)));
+    ASSERT_TRUE(waiterEntered.try_wait_for(std::chrono::seconds(5)));
+    auto paused = task->requestPause();
+    finishArbitration.post();
+    startLookup.post();
+    EXPECT_TRUE(std::move(paused).wait(std::chrono::seconds(5)))
+        << "coalesced waiter prevents task pause";
+    // Resume even on failure so the broken control terminates cleanly.
+    exec::Task::resume(task);
+    EXPECT_EQ(creator.get(), waiter.get());
+    EXPECT_EQ(cache->snapshot()["coalesced_fills"].asInt(), 1);
+    EXPECT_EQ(cache->evict(0), failAllocation ? 0 : 8L << 20);
+    EXPECT_EQ(cache->pool()->usedBytes(), 0);
+  }
 }
 
 TEST_F(GpuInputCacheTest, ShardedAdmissionBypassesWithoutSpilling) {

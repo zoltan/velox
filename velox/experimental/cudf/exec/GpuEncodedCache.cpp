@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/cudf/exec/GpuEncodedCache.h"
 
+#include <folly/ScopeGuard.h>
+
 namespace facebook::velox::cudf_velox {
 
 GpuEncodedCache::Completion::~Completion() {
@@ -303,15 +305,24 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
         ++coalesced_;
         if (profile_)
           lockHoldNs_ += now() - acquired;
-        entry->filled.wait(
-            lock, [&] { return entry->state != State::Filling; });
-        if (entry->state == State::Failed) {
-          --entry->pins;
-          lease.setEntry(nullptr);
-          return nullptr;
-        }
-        // The wait releases the mutex. Do not count it as metadata lock hold.
         lock.unlock();
+        // A creator can be suspended by allocation arbitration. Its task must
+        // be able to pause while another driver waits for that same fill.
+        exec::suspendDriverForMemoryArbitration();
+        {
+          SCOPE_EXIT {
+            exec::resumeDriverAfterMemoryArbitration();
+          };
+          // Destroy this lock before resuming, which may wait for a task pause.
+          std::unique_lock waitLock(shard.mutex);
+          entry->filled.wait(
+              waitLock, [&] { return entry->state != State::Filling; });
+          if (entry->state == State::Failed) {
+            --entry->pins;
+            lease.setEntry(nullptr);
+            return nullptr;
+          }
+        }
         lease.prepareCompletion();
         check(cudaStreamWaitEvent(stream, entry->ready, 0));
         return std::make_shared<Lease>(std::move(lease));
@@ -422,7 +433,9 @@ void GpuEncodedCache::release(
     entry->consumers.splice(entry->consumers.end(), previous);
     entry->consumers.splice(entry->consumers.end(), completion);
     VELOX_CHECK_GT(entry->pins, 0);
-    if (--entry->pins == 0) {
+    // A failed acquisition can unwind while the creator removes a failed fill.
+    // That entry no longer has a queue node to return to the idle list.
+    if (--entry->pins == 0 && entry->state != State::Failed) {
       shard.idle.splice(shard.idle.end(), shard.pinned, entry->position);
       eligible_ += entry->bytes;
     }
