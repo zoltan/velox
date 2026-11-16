@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/GpuEncodedCache.h"
 #include "velox/experimental/cudf/io/CachedDeviceRead.h"
 
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/File.h"
 #include "velox/common/memory/SharedArbitrator.h"
 #include "velox/core/QueryCtx.h"
@@ -346,6 +347,75 @@ class CacheableInput : public dwio::common::BufferedInput {
  private:
   bool cacheable_;
 };
+
+TEST_F(GpuInputCacheTest, cachedReadKeepsPaddingOutsideLogicalView) {
+  auto resource = createCudfCustomMemoryResource(128L << 20, true);
+  auto cache = std::make_shared<GpuEncodedCache>(
+      resource, createMemoryResource("cuda", 0));
+  rmm::cuda_stream stream;
+  int fills{0};
+  auto fill = [&](void* destination) {
+    ++fills;
+    GpuEncodedCache::check(
+        cudaMemsetAsync(destination, 0x39, 5, stream.value()));
+  };
+  auto first = readCachedDeviceRange(cache, "padded", 5, 3, stream, fill);
+  auto hit = readCachedDeviceRange(cache, "padded", 5, 3, stream, fill);
+  auto supplied = readCachedDeviceRange(
+      cache,
+      "padded",
+      5,
+      3,
+      stream,
+      fill,
+      nullptr,
+      cache->get("padded", stream.value()));
+  for (auto* result : {&first, &hit, &supplied}) {
+    ASSERT_TRUE(result->batch);
+    result->batch.waitOn(stream);
+    ASSERT_EQ(result->batch.data.size(), 1);
+    EXPECT_EQ(result->batch.data.front().size(), 5);
+    EXPECT_EQ(
+        result->batch.data.front().data(), first.batch.data.front().data());
+  }
+  EXPECT_EQ(first.outcome, DeviceCacheOutcome::Fill);
+  EXPECT_EQ(hit.outcome, DeviceCacheOutcome::Hit);
+  EXPECT_EQ(supplied.outcome, DeviceCacheOutcome::Hit);
+  EXPECT_EQ(fills, 1);
+  std::array<unsigned char, 8> bytes{};
+  GpuEncodedCache::check(cudaMemcpyAsync(
+      bytes.data(),
+      first.batch.data.front().data(),
+      bytes.size(),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  first = {};
+  hit = {};
+  supplied = {};
+  EXPECT_EQ(cache->evict(0), 8);
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    EXPECT_EQ(bytes[i], i < 5 ? 0x39 : 0);
+  }
+  EXPECT_EQ(cache->pool()->usedBytes(), 0);
+}
+
+TEST_F(GpuInputCacheTest, cachedReadRejectsMismatchedSuppliedLease) {
+  auto resource = createCudfCustomMemoryResource(128L << 20, true);
+  auto cache = std::make_shared<GpuEncodedCache>(
+      resource, createMemoryResource("cuda", 0));
+  rmm::cuda_stream stream;
+  auto lease =
+      cache->getOrFill("padded", 8, stream.value(), [&](void* destination) {
+        GpuEncodedCache::check(
+            cudaMemsetAsync(destination, 0, 8, stream.value()));
+      });
+  VELOX_ASSERT_THROW(
+      readCachedDeviceRange(
+          cache, "padded", 5, 2, stream, [](void*) {}, nullptr, lease),
+      "Cached allocation size does not match requested bytes and padding");
+  lease.reset();
+  EXPECT_EQ(cache->evict(0), 8);
+}
 
 TEST_F(GpuInputCacheTest, retainedParquetInputIsZeroCopyAndPadded) {
   const auto resource = createCudfCustomMemoryResource(128L << 20, true);

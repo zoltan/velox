@@ -49,9 +49,13 @@ CachedDeviceRead readCachedDeviceRange(
   CachedDeviceRead result;
   if (!lease)
     return result;
+  VELOX_CHECK_EQ(
+      lease->size(),
+      bytes + padding,
+      "Cached allocation size does not match requested bytes and padding");
   result.outcome = filled ? DeviceCacheOutcome::Fill : DeviceCacheOutcome::Hit;
   result.batch.data.emplace_back(
-      static_cast<const uint8_t*>(lease->data()), lease->size());
+      static_cast<const uint8_t*>(lease->data()), bytes);
   result.batch.owner = lease;
   result.batch.ready = [lease = std::move(lease)](cuda::stream_ref consumer) {
     lease->waitForFillOn(consumer.get());

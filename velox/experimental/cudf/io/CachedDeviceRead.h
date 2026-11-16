@@ -34,6 +34,8 @@ struct CachedDeviceRead {
 
 /// Format-independent cache admission and lease-to-device-input adaptation.
 /// Padding belongs to the key/byte contract supplied by the format adapter.
+/// Return bytes as the logical view length; retain bytes + padding in storage.
+/// A supplied lease must match that allocation size.
 /// A rejected admission returns an empty batch; the caller retains its existing
 /// allocation/coalescing policy for bypass. fill must enqueue on producer and
 /// retain host sources until DMA completes, just as GpuEncodedCache requires.
