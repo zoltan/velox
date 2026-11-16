@@ -1166,6 +1166,43 @@ void SharedArbitrator::runGlobalArbitration() {
                       << " with " << round << " rounds";
 }
 
+uint64_t SharedArbitrator::reclaimDiscardableMemory(
+    uint64_t targetBytes,
+    bool* moreReclaimable) {
+  if (moreReclaimable)
+    *moreReclaimable = false;
+  checkRunning();
+  if (!boundedDiscardableReclaim_ || targetBytes == 0)
+    return 0;
+  ScopedMemoryArbitrationContext arbitrationCtx{*this};
+  folly::stop_watch<std::chrono::nanoseconds> watch;
+  uint64_t reclaimed = 0;
+  for (const auto& candidate : getCandidates()) {
+    if (reclaimed >= targetBytes)
+      break;
+    if (dynamic_cast<DiscardableMemoryReclaimer*>(
+            candidate.participant->pool()->reclaimer()) == nullptr)
+      continue;
+    // Include a cache with zero currently eligible bytes: another callback
+    // may have detached its entries but not finished freeing them. The existing
+    // participant lock drains that callback before this external request
+    // returns.
+    reclaimed += reclaim(
+        candidate.participant,
+        targetBytes - reclaimed,
+        maxArbitrationTimeNs_,
+        /*localArbitration=*/false);
+    // Returned capacity can be zero even after freeing physical storage: a
+    // concurrent shrink or the participant's retained capacity owns the credit.
+    // Report remaining eligible payload independently, for physical OOM retry.
+    if (moreReclaimable &&
+        candidate.participant->pool()->reclaimableBytes().value_or(0) > 0)
+      *moreReclaimable = true;
+  }
+  updateGlobalArbitrationStats(watch.elapsed().count(), reclaimed);
+  return reclaimed;
+}
+
 bool SharedArbitrator::canAdmitDiscardable() const {
   return state_.load() != State::kShutdown &&
       numGlobalArbitrationWaiters_.load() == 0;

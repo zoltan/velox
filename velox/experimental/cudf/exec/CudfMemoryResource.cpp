@@ -17,10 +17,48 @@
 #include "velox/experimental/cudf/exec/CudfMemoryResource.h"
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/memory/DiscardableMemoryReclaimer.h"
+#include "velox/common/memory/SharedArbitrator.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/MemoryReclaimer.h"
 
 namespace facebook::velox::cudf_velox::detail {
+namespace {
+// Logical reservation can succeed while a bounded or fragmented RMM allocator
+// cannot supply a block. Only operator allocations may recover cache storage.
+template <typename Allocate>
+void* allocateWithCacheRecovery(
+    memory::MemoryPool* pool,
+    uint64_t bytes,
+    Allocate allocate) {
+  uint64_t target = std::max<uint64_t>(bytes, 16ULL << 20);
+  bool retriedAfterDrain = false;
+  for (unsigned attempt = 0;; ++attempt) {
+    try {
+      return allocate();
+    } catch (const std::bad_alloc&) {
+      if (retriedAfterDrain || attempt == 16 ||
+          dynamic_cast<memory::DiscardableMemoryReclaimer*>(
+              pool->root()->reclaimer())) {
+        throw;
+      }
+      auto* arbitrator =
+          dynamic_cast<memory::SharedArbitrator*>(pool->arbitrator());
+      if (!arbitrator || !arbitrator->discardableReclaimEnabled()) {
+        throw;
+      }
+      bool moreReclaimable = false;
+      const auto reclaimed =
+          arbitrator->reclaimDiscardableMemory(target, &moreReclaimable);
+      // A concurrent reclaimer may own the capacity credit. Try once after it
+      // finishes even when this request receives no additional capacity.
+      retriedAfterDrain = reclaimed == 0 && !moreReclaimable;
+      const auto capacity = static_cast<uint64_t>(pool->root()->maxCapacity());
+      target = target > capacity / 2 ? capacity : target * 2;
+    }
+  }
+}
+} // namespace
 
 CudfMemoryResourceImpl::CudfMemoryResourceImpl(
     cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
@@ -39,7 +77,9 @@ void* CudfMemoryResourceImpl::allocate_sync(
 
   pool_->reportExternalAllocation(bytes);
   try {
-    return upstream_.allocate_sync(bytes, alignment);
+    return allocateWithCacheRecovery(pool_.get(), bytes, [&] {
+      return upstream_.allocate_sync(bytes, alignment);
+    });
   } catch (...) {
     pool_->reportExternalFree(bytes);
     throw;
@@ -66,7 +106,9 @@ void* CudfMemoryResourceImpl::allocate(
 
   pool_->reportExternalAllocation(bytes);
   try {
-    return upstream_.allocate(stream, bytes, alignment);
+    return allocateWithCacheRecovery(pool_.get(), bytes, [&] {
+      return upstream_.allocate(stream, bytes, alignment);
+    });
   } catch (...) {
     pool_->reportExternalFree(bytes);
     throw;

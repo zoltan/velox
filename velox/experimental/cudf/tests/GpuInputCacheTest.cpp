@@ -22,12 +22,15 @@
 #include "velox/common/file/File.h"
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 
 #include <folly/ScopeGuard.h>
 #include <folly/executors/InlineExecutor.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <future>
+#include <iostream>
 #include <thread>
 
 namespace facebook::velox::cudf_velox {
@@ -323,6 +326,122 @@ TEST_F(GpuInputCacheTest, concurrentEvictionReleasesEachAllocationOnce) {
   EXPECT_EQ(freed, 64L << 20);
   EXPECT_EQ(cache->pool()->usedBytes(), 0);
   EXPECT_EQ(cache->snapshot()["inspected_entries"].asInt(), 64);
+}
+
+TEST_F(GpuInputCacheTest, physicalAllocatorFailureRecoversCacheOnly) {
+  for (bool asynchronous : {false, true}) {
+    SCOPED_TRACE(asynchronous);
+    auto resource = createCudfCustomMemoryResource(256L << 20, true);
+    cuda::mr::any_resource<cuda::mr::device_accessible> upstream{
+        rmm::mr::pool_memory_resource{
+            createMemoryResource("cuda", 0), 64L << 20, 64L << 20}};
+    auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+    GpuEncodedCache::LeasePtr pin;
+    for (int i = 0; i < 4; ++i) {
+      auto lease =
+          cache->getOrFill(std::to_string(i), 12L << 20, nullptr, [](void* p) {
+            GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 12L << 20));
+          });
+      ASSERT_TRUE(lease);
+      if (i == 0) {
+        pin = std::move(lease);
+      }
+    }
+    auto root =
+        memory::memoryManager()->addCustomRootPool("physical-demand", resource);
+    auto leaf = root->addLeafChild("request");
+    CudfMemoryResource allocation(upstream, leaf);
+    void* data = nullptr;
+    ASSERT_NO_THROW(
+        data = asynchronous
+            ? allocation.allocate(
+                  cuda::stream_ref{cudaStream_t{nullptr}},
+                  32L << 20,
+                  alignof(std::max_align_t))
+            : allocation.allocate_sync(32L << 20, alignof(std::max_align_t)));
+    ASSERT_NE(data, nullptr);
+    EXPECT_GE(cache->snapshot()["freed_bytes"].asInt(), 16L << 20);
+    EXPECT_EQ(resource->arbitrator()->stats().numAborted, 0);
+    unsigned char byte = 0;
+    GpuEncodedCache::check(
+        cudaMemcpy(&byte, pin->data(), 1, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(byte, 0x5a);
+    if (asynchronous) {
+      allocation.deallocate(
+          cuda::stream_ref{cudaStream_t{nullptr}},
+          data,
+          32L << 20,
+          alignof(std::max_align_t));
+    } else {
+      allocation.deallocate_sync(data, 32L << 20, alignof(std::max_align_t));
+    }
+    pin.reset();
+    cache->evict(0);
+    EXPECT_EQ(cache->pool()->usedBytes(), 0);
+    EXPECT_EQ(leaf->usedBytes(), 0);
+  }
+}
+
+TEST_F(GpuInputCacheTest, logicalPressureUsesDiscardableStorage) {
+  auto resource = createCudfCustomMemoryResource(64L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_TRUE(
+        cache->getOrFill(std::to_string(i), 8L << 20, nullptr, [](void* p) {
+          GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
+        }));
+  }
+  auto root =
+      memory::memoryManager()->addCustomRootPool("logical-demand", resource);
+  auto leaf = root->addLeafChild("request");
+  CudfMemoryResource allocation(upstream, leaf);
+  auto* data = allocation.allocate_sync(32L << 20, alignof(std::max_align_t));
+  EXPECT_GE(cache->snapshot()["freed_bytes"].asInt(), 16L << 20);
+  EXPECT_EQ(resource->arbitrator()->stats().numAborted, 0);
+  EXPECT_EQ(cache->snapshot()["cache_aborts"].asInt(), 0);
+  allocation.deallocate_sync(data, 32L << 20, alignof(std::max_align_t));
+  cache->evict(0);
+  EXPECT_EQ(cache->pool()->usedBytes(), 0);
+}
+
+TEST_F(GpuInputCacheTest, fullDeviceCapacityIsShared) {
+  if (std::getenv("VELOX_GPU_CACHE_FULL_CAPACITY_TEST") == nullptr) {
+    GTEST_SKIP()
+        << "Set VELOX_GPU_CACHE_FULL_CAPACITY_TEST on an idle 96 GiB GPU";
+  }
+  constexpr int64_t kGiB = 1L << 30;
+  size_t initialFree = 0, total = 0;
+  GpuEncodedCache::check(cudaMemGetInfo(&initialFree, &total));
+  ASSERT_GE(initialFree, 92L * kGiB);
+  auto resource = createCudfCustomMemoryResource(90L * kGiB, true);
+  rmm::mr::statistics_resource_adaptor tracker(createMemoryResource("cuda", 0));
+  cuda::mr::any_resource<cuda::mr::device_accessible> upstream{tracker};
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_TRUE(cache->getOrFill(std::to_string(i), kGiB, nullptr, [](void* p) {
+      GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, kGiB));
+    }));
+  }
+  auto root = memory::memoryManager()->addCustomRootPool(
+      "full-device-demand", resource);
+  auto leaf = root->addLeafChild("request");
+  CudfMemoryResource allocation(upstream, leaf);
+  auto* data = allocation.allocate_sync(32L * kGiB, alignof(std::max_align_t));
+  const auto counts = tracker.get_bytes_counter();
+  size_t currentFree = 0;
+  GpuEncodedCache::check(cudaMemGetInfo(&currentFree, &total));
+  std::cout << "GPU_CACHE_CAPACITY live=" << counts.value
+            << " peak=" << counts.peak
+            << " device_used_delta=" << initialFree - currentFree
+            << " cache_freed=" << cache->snapshot()["freed_bytes"].asInt()
+            << std::endl;
+  EXPECT_GE(counts.peak, 88L * kGiB);
+  EXPECT_LE(counts.peak, 90L * kGiB);
+  EXPECT_EQ(resource->arbitrator()->stats().numAborted, 0);
+  allocation.deallocate_sync(data, 32L * kGiB, alignof(std::max_align_t));
+  cache->evict(0);
+  EXPECT_EQ(tracker.get_bytes_counter().value, 0);
 }
 
 } // namespace

@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfMemoryResource.h"
+#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
@@ -24,6 +25,7 @@
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/memory/MemoryArbitrator.h"
+#include "velox/common/memory/SharedArbitrator.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/Task.h"
@@ -53,6 +55,8 @@ namespace facebook::velox::cudf_velox {
 namespace {
 struct HostBackedResourceState {
   std::atomic<bool> failNextAllocation{false};
+  std::atomic<bool> failAllAllocations{false};
+  std::atomic<int> failAllocationCount{0};
   std::atomic<bool> failNextCopy{false};
   std::atomic<std::uintptr_t> allocationStream{0};
   std::atomic<std::uintptr_t> deallocationStream{0};
@@ -76,7 +80,13 @@ class HostBackedDeviceResource {
   }
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment) {
-    if (state_->failNextAllocation.exchange(false)) {
+    int remaining = state_->failAllocationCount.load();
+    while (remaining > 0 &&
+           !state_->failAllocationCount.compare_exchange_weak(
+               remaining, remaining - 1)) {
+    }
+    if (remaining > 0 || state_->failAllAllocations ||
+        state_->failNextAllocation.exchange(false)) {
       throw std::bad_alloc{};
     }
     auto* allocation = ::operator new(bytes, std::align_val_t(alignment));
@@ -170,6 +180,194 @@ class CudfMemoryResourceTest : public testing::Test {
     memory::MemoryManager::initialize({});
   }
 };
+// Inject failure after logical reservation. GPU cache buffers are real; the
+// requesting allocator is the existing host-backed fault-injection resource.
+void exercisePhysicalCacheRecovery(
+    bool asynchronous,
+    bool enabled,
+    bool allPinned) {
+  setCudfContextDevice(0);
+  auto owner = createCudfCustomMemoryResource(256L << 20, enabled);
+  auto cache =
+      std::make_shared<GpuEncodedCache>(owner, createMemoryResource("cuda", 0));
+  std::vector<GpuEncodedCache::LeasePtr> pins;
+  for (int i = 0; i < 8; ++i) {
+    auto lease =
+        cache->getOrFill(std::to_string(i), 8L << 20, nullptr, [](void* p) {
+          GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
+        });
+    ASSERT_TRUE(lease);
+    if (allPinned || i == 0)
+      pins.push_back(std::move(lease));
+  }
+  auto root =
+      memory::memoryManager()->addCustomRootPool("physical-retry", owner);
+  auto leaf = root->addLeafChild("request");
+  auto state = std::make_shared<HostBackedResourceState>();
+  CudfMemoryResource request(makeTestUpstream(state), leaf);
+  state->failNextAllocation = true;
+  state->failAllAllocations = allPinned;
+  const auto before = cache->snapshot();
+  auto allocate = [&] {
+    return asynchronous
+        ? request.allocate(
+              cuda::stream_ref{cudaStream_t{nullptr}},
+              8L << 20,
+              alignof(std::max_align_t))
+        : request.allocate_sync(8L << 20, alignof(std::max_align_t));
+  };
+  if (!enabled || allPinned) {
+    EXPECT_THROW(allocate(), std::bad_alloc);
+    EXPECT_EQ(leaf->usedBytes(), 0);
+    EXPECT_EQ(cache->snapshot()["freed_bytes"].asInt(), 0);
+  } else {
+    void* p = allocate();
+    EXPECT_EQ(leaf->usedBytes(), 8L << 20);
+    EXPECT_EQ(
+        cache->snapshot()["freed_bytes"].asInt() -
+            before["freed_bytes"].asInt(),
+        16L << 20);
+    if (asynchronous)
+      request.deallocate(
+          cuda::stream_ref{cudaStream_t{nullptr}},
+          p,
+          8L << 20,
+          alignof(std::max_align_t));
+    else
+      request.deallocate_sync(p, 8L << 20, alignof(std::max_align_t));
+  }
+  EXPECT_EQ(cache->snapshot()["cache_aborts"].asInt(), 0);
+  EXPECT_EQ(owner->arbitrator()->stats().numAborted, 0);
+  EXPECT_EQ(leaf->usedBytes(), 0);
+  EXPECT_EQ(state->liveBytes.load(), 0);
+  unsigned char value = 0;
+  GpuEncodedCache::check(
+      cudaMemcpy(&value, pins.front()->data(), 1, cudaMemcpyDeviceToHost));
+  EXPECT_EQ(value, 0x5a);
+  pins.clear();
+  cache->evict(0);
+  EXPECT_EQ(cache->pool()->usedBytes(), 0);
+}
+TEST_F(CudfMemoryResourceTest, ShardedPhysicalFailureRecoverySync) {
+  exercisePhysicalCacheRecovery(false, true, false);
+}
+TEST_F(CudfMemoryResourceTest, ShardedPhysicalFailureRecoveryAsync) {
+  exercisePhysicalCacheRecovery(true, true, false);
+}
+TEST_F(CudfMemoryResourceTest, ShardedPhysicalFailureHonorsPinsAndPolicy) {
+  exercisePhysicalCacheRecovery(false, true, true);
+  exercisePhysicalCacheRecovery(true, false, false);
+}
+
+TEST_F(CudfMemoryResourceTest, ShardedPhysicalRetryDrainsConcurrentReclaim) {
+  struct State {
+    std::atomic<bool> eligible{true};
+    std::promise<void> entered, finish;
+    std::shared_future<void> gate{finish.get_future().share()};
+    memory::MemoryPool* leaf{nullptr};
+  };
+  class DelayedCache final : public memory::DiscardableMemoryReclaimer {
+   public:
+    explicit DelayedCache(std::shared_ptr<State> state)
+        : DiscardableMemoryReclaimer(0), state_(std::move(state)) {}
+    bool reclaimableBytes(const memory::MemoryPool&, uint64_t& bytes)
+        const override {
+      bytes = state_->eligible ? 64L << 20 : 0;
+      return bytes != 0;
+    }
+    uint64_t reclaim(memory::MemoryPool*, uint64_t, uint64_t, Stats& stats)
+        override {
+      if (!state_->eligible.exchange(false))
+        return 0;
+      state_->entered.set_value();
+      state_->gate.wait();
+      state_->leaf->reportExternalFree(64L << 20);
+      state_->leaf->release();
+      stats.reclaimedBytes += 64L << 20;
+      return 64L << 20;
+    }
+
+   private:
+    std::shared_ptr<State> state_;
+  };
+  auto owner = createCudfCustomMemoryResource(256L << 20, true);
+  auto state = std::make_shared<State>();
+  auto cacheRoot = memory::memoryManager()->addCustomRootPool(
+      "pending-cache",
+      owner->allocator(),
+      owner->arbitrator(),
+      owner->maxCapacity(),
+      std::make_unique<DelayedCache>(state));
+  auto cacheLeaf = cacheRoot->addLeafChild("pending-free");
+  state->leaf = cacheLeaf.get();
+  cacheLeaf->reportExternalAllocation(64L << 20);
+  auto* arb = static_cast<memory::SharedArbitrator*>(owner->arbitrator());
+  auto reclaim = std::async(std::launch::async, [&] {
+    return arb->reclaimDiscardableMemory(16L << 20);
+  });
+  state->entered.get_future().wait();
+  auto root = memory::memoryManager()->addCustomRootPool(
+      "request-during-reclaim", owner);
+  auto leaf = root->addLeafChild("request");
+  auto upstream = std::make_shared<HostBackedResourceState>();
+  upstream->failNextAllocation = true;
+  CudfMemoryResource request(makeTestUpstream(upstream), leaf);
+  std::jthread finish([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    state->finish.set_value();
+  });
+  const auto start = std::chrono::steady_clock::now();
+  void* data = request.allocate_sync(8L << 20, alignof(std::max_align_t));
+  EXPECT_GE(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count(),
+      10);
+  finish.join();
+  EXPECT_EQ(reclaim.get(), 64L << 20);
+  request.deallocate_sync(data, 8L << 20, alignof(std::max_align_t));
+  EXPECT_EQ(leaf->usedBytes(), 0);
+  EXPECT_EQ(cacheLeaf->usedBytes(), 0);
+  EXPECT_EQ(owner->arbitrator()->stats().numAborted, 0);
+}
+
+TEST_F(CudfMemoryResourceTest, ShardedPhysicalRetryWithZeroCapacityCredit) {
+  setCudfContextDevice(0);
+  auto base = createCudfCustomMemoryResource(256L << 20, true);
+  auto config = base->arbitrator()->config();
+  config.extraConfigs["memory-pool-min-free-capacity"] = "256MB";
+  config.extraConfigs["memory-pool-min-free-capacity-pct"] = "1.0";
+  auto owner = std::make_shared<memory::CustomMemoryResource>(
+      "gpu",
+      std::shared_ptr<memory::MemoryAllocator>(base, base->allocator()),
+      std::make_shared<memory::SharedArbitrator>(config),
+      [base](const memory::ReclaimerContext& ctx) {
+        return base->newReclaimer(ctx);
+      },
+      256L << 20);
+  auto cache =
+      std::make_shared<GpuEncodedCache>(owner, createMemoryResource("cuda", 0));
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(
+        cache->getOrFill(std::to_string(i), 8L << 20, nullptr, [](void* p) {
+          GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
+        }));
+  auto root =
+      memory::memoryManager()->addCustomRootPool("zero-credit-demand", owner);
+  auto leaf = root->addLeafChild("request");
+  auto state = std::make_shared<HostBackedResourceState>();
+  state->failAllocationCount = 2;
+  CudfMemoryResource request(makeTestUpstream(state), leaf);
+  void* data = request.allocate_sync(8L << 20, alignof(std::max_align_t));
+  // Both reclaim callbacks free real buffers but retain logical free capacity.
+  EXPECT_EQ(cache->snapshot()["freed_bytes"].asInt(), 48L << 20);
+  EXPECT_EQ(cache->snapshot()["reclaim_calls"].asInt(), 2);
+  EXPECT_EQ(owner->arbitrator()->stats().numAborted, 0);
+  request.deallocate_sync(data, 8L << 20, alignof(std::max_align_t));
+  EXPECT_EQ(leaf->usedBytes(), 0);
+  cache->evict(0);
+}
+
 TEST_F(CudfMemoryResourceTest, ReportsAcrossThreadsAndRollsBackFailure) {
   auto root = memory::memoryManager()->addRootPool();
   auto pool = root->addLeafChild("cudfMemoryResourceTest");

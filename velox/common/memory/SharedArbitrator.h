@@ -291,6 +291,20 @@ class SharedArbitrator : public memory::MemoryArbitrator {
       bool allowSpill = true,
       bool force = false) override final;
 
+  /// Reclaim discardable storage after a physical allocator refuses a request.
+  /// Wait for concurrent reclamation of the same participant. Return released
+  /// capacity, which can differ from freed storage. Set moreReclaimable when
+  /// inspected cache participants still have eligible storage. Never spill or
+  /// abort operator state. Requires bounded-discardable-reclaim to be enabled.
+  uint64_t reclaimDiscardableMemory(
+      uint64_t targetBytes,
+      bool* moreReclaimable = nullptr);
+
+  /// Return whether the discardable-first policy is enabled.
+  bool discardableReclaimEnabled() const {
+    return boundedDiscardableReclaim_;
+  }
+
   /// Return whether opportunistic cache admission may use spare capacity.
   /// Cache implementations also consult this before using retained
   /// reservations.
