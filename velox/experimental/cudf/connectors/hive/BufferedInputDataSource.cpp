@@ -44,13 +44,14 @@ std::future<size_t> submitDeviceRead(
   auto result = task->get_future();
   auto once = std::make_shared<std::once_flag>();
   auto run = [once, task]() { std::call_once(*once, [task]() { (*task)(); }); };
-  executor->add(run);
-  return std::async(
-      std::launch::deferred,
-      [run = std::move(run), result = std::move(result)]() mutable {
+  // Complete fallible future construction before the executor can accept work.
+  auto completion = std::async(
+      std::launch::deferred, [run, result = std::move(result)]() mutable {
         run();
         return result.get();
       });
+  executor->add(std::move(run));
+  return completion;
 }
 
 } // namespace

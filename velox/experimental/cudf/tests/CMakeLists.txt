@@ -113,6 +113,13 @@ velox_add_cudf_test(
   LIBS velox_cudf_exec Folly::folly
 )
 
+# Keep the process-wide allocation override isolated from other reader tests.
+velox_add_cudf_test(
+  NAME velox_cudf_buffered_read_failure_test
+  SOURCES BufferedReadFailureTest.cpp
+  LIBS velox_cudf_hive_connector velox_cudf_exec
+)
+
 velox_add_cudf_test(
   NAME velox_cudf_split_reader_test
   SOURCES Main.cpp CudfSplitReaderTest.cpp CudfSplitReaderByteFetchTest.cpp
