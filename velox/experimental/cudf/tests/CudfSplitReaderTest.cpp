@@ -272,7 +272,10 @@ TEST_F(CudfSplitReaderTest, setsPushdownFilterAfterReadingMetadata) {
 
   reader.setPushdownFilter(&splitFilter);
   dwio::common::RuntimeStats runtimeStats;
+  // Footer inspection only allocates host metadata. Attach GPU resources before
+  // preparation, and reject replacing them even before decoding starts.
   reader.setMemoryResources(*mr_, *output_mr_);
+  EXPECT_THROW(reader.setMemoryResources(*mr_, *output_mr_), VeloxRuntimeError);
   reader.prepareSplit(runtimeStats);
   EXPECT_THROW(reader.setMemoryResources(*mr_, *output_mr_), VeloxRuntimeError);
   EXPECT_EQ(reader.logicalFilter(), &logicalFilter);

@@ -251,7 +251,7 @@ void CudfSplitReader::setMemoryResources(
     cuda::mr::any_resource<cuda::mr::device_accessible> output) {
   VELOX_CHECK(
       !tempMemoryResource_ && !outputMemoryResource_ && !splitReader_ &&
-          !passState_ && fileMetaDatas_.empty(),
+          !passState_,
       "Memory resources must be set once, before split preparation");
   tempMemoryResource_ = std::move(temp);
   outputMemoryResource_ = std::move(output);
