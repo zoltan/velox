@@ -18,13 +18,17 @@ algorithm.
 Reclaimers record released storage in `MemoryReclaimer::Stats::reclaimedBytes`.
 Another allocator may return a freed reservation before the controller's own
 shrink. These statistics let the controller recognize progress and reconsider
-current demand without unnecessarily falling back to operator reclamation.
+current demand before falling back to operator reclamation. At most one round
+may count statistics-only progress without returned capacity; repeated refill
+churn therefore cannot indefinitely suppress spilling or aborting.
 
 Cache admission first uses its own available capacity, then unassigned capacity
 or unused reservations in other pools. If these cannot satisfy the request,
 admission fails with `MEM_POOL_CAP_EXCEEDED`. A cache adapter should treat this as
 an opportunity to bypass admission and continue the read. Filling a speculative
-cache does not justify reclaiming live operator state or existing cache entries.
+cache does not justify reclaiming live operator state. An adapter may evict its
+own idle entries and retry once. `canAdmitDiscardable()` lets adapters also
+defer admission within retained capacity while global requesters are waiting.
 
 ## Pressure handling
 
@@ -37,11 +41,14 @@ candidate's reported reclaimable bytes.
 
 Targets use allocation demand rather than the global percentage-based reclaim
 floor or speculative pool growth. They are not hard limits on bytes freed:
-existing participant minimum-reclaim settings and cache entry granularity still
-apply. Successful reclamation returns capacity through the existing arbitrator
+cache entry granularity still applies. Discardable reclaim bypasses the
+participant minimum-size and percentage floors. Successful reclamation returns capacity through the existing arbitrator
 and wakes waiting requests. If discardable pools make no progress, ordinary
-spill/abort selection resumes. Exceptions from a cache reclaimer retain the
-existing participant-abort behavior.
+spill/abort selection resumes. Discardable pools are excluded from abort-victim
+selection even when the policy is disabled. Exceptions from a cache reclaimer
+retain the existing participant-abort behavior; adapters must handle that state.
+Explicit external shrink also releases unused capacity and idle cache storage
+before spilling or aborting query pools.
 
 The policy reuses the controller, participant synchronization, and capacity
 accounting. It adds no lock to allocations that fit in their current reservation.
@@ -52,7 +59,8 @@ remains serialized; this policy does not promise lock-free reclamation.
 
 This policy applies to any reconstructible root-pool storage. It does not depend
 on a file format, AsyncDataCache implementation, GPU library, or query plan.
-Disabling or omitting the configuration retains ordinary arbitration selection.
+Disabling or omitting the configuration retains ordinary reclamation selection;
+discardable pools remain excluded from abort-victim selection.
 
 `velox_discardable_memory_test` uses actual CPU pool allocations to exercise
 admission, cache-first selection, fallback, and concurrent requesters. GPU memory
