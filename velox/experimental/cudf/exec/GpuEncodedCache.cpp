@@ -326,8 +326,6 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
   ensureCudaContextForThread();
   auto* arbitrator =
       dynamic_cast<memory::SharedArbitrator*>(resource_->arbitrator());
-  const bool canAdmit = !admissionDisabled_.load() &&
-      (!arbitrator || arbitrator->canAdmitDiscardable());
   Lease lease(shared_from_this(), stream);
   auto& shard = shardFor(key);
   std::shared_ptr<Entry> entry;
@@ -347,7 +345,9 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
           lockHoldNs_ += now() - acquired;
         return nullptr;
       }
-      if (!canAdmit || now() < admitAfterNs_.load()) {
+      if (admissionDisabled_.load() ||
+          (arbitrator && !arbitrator->canAdmitDiscardable()) ||
+          now() < admitAfterNs_.load()) {
         ++bypasses_;
         if (profile_)
           lockHoldNs_ += now() - acquired;
