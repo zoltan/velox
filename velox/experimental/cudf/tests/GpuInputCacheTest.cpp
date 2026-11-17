@@ -629,6 +629,61 @@ TEST_F(GpuInputCacheTest, abandonedAsyncFillCompletesBeforeRelease) {
   EXPECT_EQ(cache->evict(0), 16);
 }
 
+TEST_F(GpuInputCacheTest, rejectedSubmissionDrainsAcceptedReads) {
+  class RejectSecondSubmission : public folly::Executor {
+   public:
+    void add(folly::Func task) override {
+      if (submissions_++ == 1) {
+        throw std::runtime_error("injected submission failure");
+      }
+      executor.add(std::move(task));
+    }
+    folly::ManualExecutor executor;
+
+   private:
+    size_t submissions_{0};
+  } executor;
+  auto resource = createCudfCustomMemoryResource(128L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  setEncodedInputGpuCache(cache);
+  SCOPE_EXIT {
+    setEncodedInputGpuCache(nullptr);
+  };
+  auto pool = memory::memoryManager()->addLeafPool();
+  StringIdMap ids;
+  auto input = std::make_shared<CacheableInput>(
+      std::make_shared<InMemoryReadFile>(std::string(32, 'x')),
+      *pool,
+      true,
+      &executor);
+  auto source = std::make_shared<RecordingInputSource>(
+      input, nullptr, std::make_shared<StringIdLease>(ids, "rejected-input"));
+  rmm::cuda_stream stream;
+  rmm::device_async_resource_ref mr{upstream};
+  const std::array<gpu::DeviceByteRange, 2> ranges{{{0, 4}, {16, 4}}};
+  EXPECT_THROW(
+      source->readDeviceRangesAsync(ranges, false, stream, mr, mr),
+      std::runtime_error);
+  // The accepted prefix is complete; the unsubmitted suffix is discarded.
+  EXPECT_EQ(source->reads.size(), 1);
+  EXPECT_EQ(cache->pool()->usedBytes(), 8);
+  executor.executor.drain();
+  {
+    auto retry = source->readDeviceRangesAsync(ranges, false, stream, mr, mr);
+    retry.waitOn(stream);
+    for (const auto& view : retry.data) {
+      uint8_t byte = 0;
+      GpuEncodedCache::check(cudaMemcpyAsync(
+          &byte, view.data(), 1, cudaMemcpyDeviceToHost, stream.value()));
+      stream.synchronize();
+      EXPECT_EQ(byte, 'x');
+    }
+  }
+  executor.executor.drain();
+  EXPECT_EQ(cache->evict(0), 16);
+}
+
 TEST_F(GpuInputCacheTest, sharedAsyncFillDoesNotWaitForFirstConsumer) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
