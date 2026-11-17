@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -200,6 +201,14 @@ class DecliningAdapter : public cudf_velox::OperatorAdapter {
   }
 };
 } // namespace
+
+TEST_F(AdapterOperatorTest, nestedLoopTranslatorDeclinesOtherNodes) {
+  auto plan = PlanBuilder()
+                  .values({makeRowVector({makeFlatVector<int64_t>({1})})})
+                  .planNode();
+  cudf_velox::CudfNestedLoopJoinBridgeTranslator translator;
+  EXPECT_EQ(translator.toJoinBridge(plan), nullptr);
+}
 
 TEST_F(AdapterOperatorTest, adapterStatsMergedIntoPlanNode) {
   auto data =
