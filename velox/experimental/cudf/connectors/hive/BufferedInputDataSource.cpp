@@ -37,6 +37,55 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 namespace {
 
+// Owns host buffers until the uploads recorded on this stream complete. The
+// normal path retires this object on the IO executor. Executor rejection falls
+// back to draining here, preserving the same lifetime guarantee.
+class HostUploadBuffers {
+ public:
+  explicit HostUploadBuffers(cuda::stream_ref stream) : stream_(stream) {
+    ensureCudaContextForThread();
+    CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming));
+  }
+
+  ~HostUploadBuffers() noexcept {
+    try {
+      ensureCudaContextForThread();
+      const auto status = recorded_ ? cudaEventSynchronize(event_)
+                                    : cudaStreamSynchronize(stream_.get());
+      if (status != cudaSuccess) {
+        // A failed context cannot establish safe DMA completion. Retain the
+        // buffers rather than freeing memory that the device may still use.
+        LOG(ERROR) << "Cannot retire cached input uploads: "
+                   << cudaGetErrorString(status);
+        retainBuffers();
+      }
+    } catch (...) {
+      retainBuffers();
+    }
+    cudaEventDestroy(event_);
+  }
+
+  void recordCompletion() {
+    ensureCudaContextForThread();
+    CUDF_CUDA_TRY(cudaEventRecord(event_, stream_.get()));
+    recorded_ = true;
+  }
+
+  std::vector<std::shared_ptr<std::unique_ptr<cudf::io::datasource::buffer>>>
+      buffers;
+
+ private:
+  void retainBuffers() noexcept {
+    for (auto& buffer : buffers) {
+      buffer->release();
+    }
+  }
+
+  cuda::stream_ref stream_;
+  cudaEvent_t event_{};
+  bool recorded_{false};
+};
+
 // Launches the `read` task on the IO executor or waiting thread, whichever
 // starts first.
 std::future<size_t> submitDeviceRead(
@@ -178,7 +227,8 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
     std::vector<bool> created;
     std::vector<std::future<size_t>> pending;
     std::vector<size_t> expected;
-    std::vector<std::shared_ptr<std::unique_ptr<buffer>>> hostBuffers;
+    std::shared_ptr<HostUploadBuffers> uploads;
+    folly::Executor* executor;
     cuda::stream_ref stream;
     explicit Owner(cuda::stream_ref value) : stream(value) {}
     gpu::DeviceReadBatch bypass;
@@ -209,13 +259,22 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
           error = std::current_exception();
         }
       }
-      if (!hostBuffers.empty()) {
-        ensureCudaContextForThread();
-        // Retain even pinned host buffers until every accepted upload finishes.
-        if (cudaStreamSynchronize(stream.get()) != cudaSuccess) {
-          std::terminate();
+      if (uploads) {
+        try {
+          uploads->recordCompletion();
+        } catch (...) {
+          if (!error) {
+            error = std::current_exception();
+          }
         }
-        hostBuffers.clear();
+        try {
+          // No driver-side device wait. A rejected submission destroys the
+          // capture here and drains safely before propagating read failures.
+          executor->add([retirement = std::move(uploads)] {});
+        } catch (...) {
+          // Cleanup was synchronous; executor shutdown does not invalidate an
+          // otherwise completed read.
+        }
       }
       if (error) {
         for (size_t i = 0; i < leases.size(); ++i) {
@@ -244,11 +303,12 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
   };
   auto owner = std::make_shared<Owner>(stream);
   owner->source = shared_from_this();
+  owner->executor = input_->executor();
   owner->leases.resize(ranges.size());
   owner->created.resize(ranges.size());
   owner->pending.reserve(ranges.size());
   owner->expected.reserve(ranges.size());
-  owner->hostBuffers.reserve(ranges.size());
+
   gpu::DeviceReadBatch result;
   result.owner = owner;
   result.data.resize(ranges.size());
@@ -330,8 +390,13 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
       std::vector<std::pair<void*, size_t>> destinations{
           {owner->leases[i]->data(), static_cast<size_t>(ranges[i].size())}};
       size_t end = i + 1;
+      // A single requested range remains indivisible; cap only aggregation of
+      // adjacent ranges so large passes retain IO executor parallelism.
+      constexpr size_t kMaxCoalescedBytes = 16L << 20;
       while (end < ranges.size() && owner->created[end] &&
-             ranges[end].offset() == offset + bytes) {
+             ranges[end].offset() == offset + bytes &&
+             bytes <= kMaxCoalescedBytes &&
+             ranges[end].size() <= kMaxCoalescedBytes - bytes) {
         destinations.emplace_back(
             owner->leases[end]->data(), ranges[end].size());
         bytes += ranges[end].size();
@@ -340,7 +405,11 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
       std::vector<GpuEncodedCache::LeasePtr> fillLeases(
           owner->leases.begin() + i, owner->leases.begin() + end);
       auto retainedBuffer = std::make_shared<std::unique_ptr<buffer>>();
-      owner->hostBuffers.push_back(retainedBuffer);
+      if (!owner->uploads) {
+        owner->uploads = std::make_shared<HostUploadBuffers>(stream);
+        owner->uploads->buffers.reserve(ranges.size());
+      }
+      owner->uploads->buffers.push_back(retainedBuffer);
       owner->expected.push_back(bytes);
       owner->pending.push_back(submitDeviceRead(
           input_->executor(),

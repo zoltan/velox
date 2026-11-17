@@ -502,6 +502,7 @@ class RecordingInputSource : public connector::hive::BufferedInputDataSource {
   std::optional<size_t> failOffset;
   std::mutex readsMutex;
   std::function<void()> beforeRead;
+  std::unique_ptr<buffer> suppliedBuffer;
   std::unique_ptr<buffer> host_read(size_t offset, size_t bytes) override {
     {
       std::lock_guard lock(readsMutex);
@@ -512,6 +513,9 @@ class RecordingInputSource : public connector::hive::BufferedInputDataSource {
     }
     if (failOffset == offset) {
       throw std::runtime_error("injected cached read failure");
+    }
+    if (suppliedBuffer) {
+      return std::move(suppliedBuffer);
     }
     return BufferedInputDataSource::host_read(offset, bytes);
   }
@@ -554,6 +558,109 @@ TEST_F(GpuInputCacheTest, coldReadsReturnPendingAndCoalesceMisses) {
         &byte, view.data(), 1, cudaMemcpyDeviceToHost, stream.value()));
     stream.synchronize();
     EXPECT_EQ(byte, 'x');
+  }
+  executor.drain();
+}
+
+TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
+  class PinnedBuffer final : public cudf::io::datasource::buffer {
+   public:
+    explicit PinnedBuffer(std::atomic<bool>& freed) : freed_(freed) {
+      GpuEncodedCache::check(cudaMallocHost(&data_, 8));
+      std::memset(data_, 'x', 8);
+    }
+    ~PinnedBuffer() override {
+      cudaFreeHost(data_);
+      freed_.store(true);
+    }
+    const uint8_t* data() const override {
+      return data_;
+    }
+    size_t size() const override {
+      return 8;
+    }
+
+   private:
+    uint8_t* data_;
+    std::atomic<bool>& freed_;
+  };
+  auto resource = createCudfCustomMemoryResource(128L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  setEncodedInputGpuCache(cache);
+  SCOPE_EXIT {
+    setEncodedInputGpuCache(nullptr);
+  };
+  auto pool = memory::memoryManager()->addLeafPool();
+  StringIdMap ids;
+  folly::CPUThreadPoolExecutor executor(2);
+  auto input = std::make_shared<CacheableInput>(
+      std::make_shared<InMemoryReadFile>(std::string(8, 'x')),
+      *pool,
+      true,
+      &executor);
+  auto source = std::make_shared<RecordingInputSource>(
+      input, nullptr, std::make_shared<StringIdLease>(ids, "pinned-async"));
+  std::atomic<bool> freed{false};
+  source->suppliedBuffer = std::make_unique<PinnedBuffer>(freed);
+  rmm::cuda_stream stream;
+  rmm::device_async_resource_ref mr{upstream};
+  // Reserve first so allocation is not hidden behind the blocked stream.
+  const std::array<gpu::DeviceByteRange, 1> ranges{{{0, 8}}};
+  std::promise<void> unblock;
+  auto gate = unblock.get_future();
+  source->beforeRead = [&] {
+    GpuEncodedCache::check(cudaLaunchHostFunc(
+        stream.value(),
+        [](void* value) { static_cast<std::future<void>*>(value)->wait(); },
+        &gate));
+  };
+  auto batch = source->readDeviceRangesAsync(ranges, false, stream, mr, mr);
+  auto completion = std::async(std::launch::async, [&] { batch.wait(); });
+  const auto status = completion.wait_for(std::chrono::seconds(2));
+  EXPECT_FALSE(freed.load());
+  unblock.set_value();
+  completion.get();
+  EXPECT_EQ(status, std::future_status::ready);
+  executor.join();
+  EXPECT_TRUE(freed.load());
+  uint8_t value = 0;
+  GpuEncodedCache::check(cudaMemcpyAsync(
+      &value, batch.data[0].data(), 1, cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  EXPECT_EQ(value, 'x');
+}
+
+TEST_F(GpuInputCacheTest, coalescedMissesHaveBoundedHostReads) {
+  auto resource = createCudfCustomMemoryResource(128L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  setEncodedInputGpuCache(cache);
+  SCOPE_EXIT {
+    setEncodedInputGpuCache(nullptr);
+  };
+  auto pool = memory::memoryManager()->addLeafPool();
+  StringIdMap ids;
+  folly::ManualExecutor executor;
+  constexpr size_t kChunk = 8L << 20;
+  auto input = std::make_shared<CacheableInput>(
+      std::make_shared<InMemoryReadFile>(std::string(3 * kChunk, 'x')),
+      *pool,
+      true,
+      &executor);
+  auto source = std::make_shared<RecordingInputSource>(
+      input, nullptr, std::make_shared<StringIdLease>(ids, "bounded-reads"));
+  rmm::cuda_stream stream;
+  rmm::device_async_resource_ref mr{upstream};
+  const std::array<gpu::DeviceByteRange, 3> ranges{
+      {{0, kChunk}, {kChunk, kChunk}, {2 * kChunk, kChunk}}};
+  auto batch = source->readDeviceRangesAsync(ranges, false, stream, mr, mr);
+  batch.waitOn(stream);
+  EXPECT_EQ(source->reads.size(), 2);
+  if (source->reads.size() == 2) {
+    EXPECT_EQ(source->reads[0], (std::pair<size_t, size_t>{0, 2 * kChunk}));
+    EXPECT_EQ(
+        source->reads[1], (std::pair<size_t, size_t>{2 * kChunk, kChunk}));
   }
   executor.drain();
 }
