@@ -75,6 +75,15 @@ class CudfFilterProject : public CudfOperatorBase {
  private:
   bool allInputProcessed();
 
+  std::unique_ptr<cudf::table>
+  filter(cudf::table_view input, cudf::table* owned, cuda::stream_ref stream);
+
+  std::vector<std::unique_ptr<cudf::column>> project(
+      const std::vector<cudf::column_view>& inputViews,
+      std::vector<std::unique_ptr<cudf::column>>* owned,
+      cudf::size_type numRows,
+      cuda::stream_ref stream);
+
   // If true exprs_[0] is a filter and the other expressions are projections
   const bool hasFilter_{false};
 

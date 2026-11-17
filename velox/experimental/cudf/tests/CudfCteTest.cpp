@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -65,6 +66,111 @@ class CudfCteTest : public OperatorTestBase {
   }
   bool savedFallback_;
 };
+
+TEST_F(CudfCteTest, sharedProjectionDoesNotCopyUnusedColumns) {
+  constexpr vector_size_t kRows = 1 << 18;
+  std::vector<VectorPtr> columns;
+  for (int i = 0; i < 10; ++i) {
+    columns.push_back(
+        makeFlatVector<int64_t>(kRows, [](auto row) { return row; }));
+  }
+  auto host = makeRowVector(columns);
+  auto plan = PlanBuilder().values({host}).project({"c0"}).planNode();
+  auto project = std::dynamic_pointer_cast<const core::ProjectNode>(plan);
+  auto task = Task::create(
+      "shared-project",
+      core::PlanFragment{plan->sources()[0]},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver =
+      Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+  cuda::stream stream{cuda::device_ref{0}};
+  auto table = with_arrow::toCudfTable(host, pool(), stream, get_output_mr());
+  auto original = std::make_shared<CudfVector>(
+      pool(), host->type(), kRows, std::move(table), stream);
+  CudfFilterProject op(0, driver->driverCtx(), nullptr, project);
+  op.initialize();
+  const auto inputBytes = cudfAllocatedBytes();
+  statsMr_->push_counters();
+  if (outputStatsMr_) {
+    outputStatsMr_->push_counters();
+  }
+  const int iterations = std::getenv("VELOX_CTE_PROJECT_ITERATIONS")
+      ? std::max(1, std::atoi(std::getenv("VELOX_CTE_PROJECT_ITERATIONS")))
+      : 1;
+  CudfVectorPtr result;
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < iterations; ++i) {
+    result.reset();
+    op.addInput(original->shareForRead(pool()));
+    result = std::dynamic_pointer_cast<CudfVector>(op.getOutput());
+  }
+  stream.sync();
+  const auto elapsed = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  auto counters = statsMr_->pop_counters().first;
+  auto allocated = counters.total;
+  auto peak = counters.peak;
+  if (outputStatsMr_) {
+    auto outputCounters = outputStatsMr_->pop_counters().first;
+    allocated += outputCounters.total;
+    peak += outputCounters.peak;
+  }
+  ASSERT_NE(result, nullptr);
+  EXPECT_LT(allocated, iterations * kRows * sizeof(int64_t) * 2);
+  std::cout << "SHARED_PROJECT allocated_bytes=" << allocated
+            << " peak_bytes=" << peak << " iterations=" << iterations
+            << " elapsed_ms=" << elapsed << " input_live_bytes=" << inputBytes
+            << " application_peak_bytes=" << inputBytes + peak << std::endl;
+  auto expected = makeRowVector({columns[0]});
+  auto actual = with_arrow::toVeloxColumn(
+      result->getTableView(),
+      pool(),
+      expected->type(),
+      stream,
+      cudf::get_current_device_resource_ref());
+  facebook::velox::test::assertEqualVectors(expected, actual);
+  auto unchanged = with_arrow::toVeloxColumn(
+      original->getTableView(),
+      pool(),
+      host->type(),
+      stream,
+      cudf::get_current_device_resource_ref());
+  facebook::velox::test::assertEqualVectors(host, unchanged);
+  op.close();
+}
+
+TEST_F(CudfCteTest, sharedFilterAndProjectionPreserveInput) {
+  auto host = makeRowVector(
+      {makeNullableFlatVector<int64_t>({0, 1, std::nullopt, 3}),
+       makeFlatVector<int64_t>({10, 11, 12, 13})});
+  createDuckDbTable({host});
+  for (const auto& predicate :
+       {"c1 >= 0", "c0 % 2 = 0", "c1 < 0", "c0 IS NULL"}) {
+    SCOPED_TRACE(predicate);
+    PlanBuilder query(pool());
+    query.with("t", [&](auto& producer) {
+      producer.values({host}).project({"c0", "c1"});
+    });
+    auto first = query.newPlan()
+                     .fromCte("t")
+                     .filter(predicate)
+                     .project({"c0 AS x", "c0 AS y", "c1 + 1 AS z"})
+                     .planNode();
+    auto second = query.newPlan()
+                      .fromCte("t")
+                      .project({"c0 AS x", "c0 AS y", "c1 AS z"})
+                      .planNode();
+    auto plan = query.localPartition({}, {first, second}).build();
+    AssertQueryBuilder(plan, duckDbQueryRunner_)
+        .assertResults(
+            fmt::format(
+                "SELECT c0, c0, c1 + 1 FROM tmp WHERE {} UNION ALL SELECT c0, c0, c1 FROM tmp",
+                predicate));
+  }
+}
 
 TEST_F(CudfCteTest, zeroCopyBuffer) {
   cuda::stream stream{cuda::device_ref{0}};

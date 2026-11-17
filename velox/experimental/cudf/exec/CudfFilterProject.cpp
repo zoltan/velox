@@ -259,16 +259,32 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  auto inputTableColumns = cudfInput->release(get_output_mr())->release();
   auto outputSize = input_->size();
-
-  if (hasFilter_) {
-    filter(inputTableColumns, stream);
+  std::vector<std::unique_ptr<cudf::column>> outputColumns;
+  if (cudfInput->isShared()) {
+    auto view = cudfInput->getTableView();
+    auto filtered = hasFilter_ ? filter(view, nullptr, stream) : nullptr;
+    if (filtered) {
+      auto columns = filtered->release();
+      outputSize = columns.empty() ? outputSize : columns.front()->size();
+      outputColumns = project(columns, outputSize, stream);
+    } else if (isIdentityProjection_) {
+      // An all-true filter can forward the immutable snapshot itself.
+      return std::exchange(input_, nullptr);
+    } else {
+      outputColumns =
+          project({view.begin(), view.end()}, nullptr, outputSize, stream);
+    }
+  } else {
+    auto columns = cudfInput->release(get_output_mr())->release();
+    if (hasFilter_) {
+      filter(columns, stream);
+    }
+    if (!columns.empty()) {
+      outputSize = columns.front()->size();
+    }
+    outputColumns = project(columns, outputSize, stream);
   }
-  if (!inputTableColumns.empty()) {
-    outputSize = inputTableColumns.front()->size();
-  }
-  auto outputColumns = project(inputTableColumns, outputSize, stream);
 
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
   auto const numColumns = outputTable->num_columns();
@@ -290,12 +306,16 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
 void CudfFilterProject::filter(
     std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
     cuda::stream_ref stream) {
-  // Evaluate the Filter
-  std::vector<cudf::column_view> inputViews;
-  inputViews.reserve(inputTableColumns.size());
-  for (auto& col : inputTableColumns) {
-    inputViews.push_back(col->view());
-  }
+  auto owned = std::make_unique<cudf::table>(std::move(inputTableColumns));
+  auto filtered = filter(owned->view(), owned.get(), stream);
+  inputTableColumns = filtered ? filtered->release() : owned->release();
+}
+
+std::unique_ptr<cudf::table> CudfFilterProject::filter(
+    cudf::table_view input,
+    cudf::table* owned,
+    cuda::stream_ref stream) {
+  std::vector<cudf::column_view> inputViews(input.begin(), input.end());
   auto filterColumn =
       filterEvaluator_->eval(inputViews, stream, get_temp_mr(), true);
   auto filterColumnView = asView(filterColumn);
@@ -315,13 +335,13 @@ void CudfFilterProject::filter(
     // If filter is not all true, apply the filter
     return !(result->is_valid(stream) && result->value(stream));
   }();
-  if (shouldApplyFilter) {
-    auto filterTable =
-        std::make_unique<cudf::table>(std::move(inputTableColumns));
-    auto filteredTable = cudf::apply_retention_mask(
-        *filterTable, filterColumnView, stream, get_output_mr());
-    inputTableColumns = filteredTable->release();
+  if (!shouldApplyFilter) {
+    return nullptr;
   }
+  return owned ? cudf::apply_retention_mask(
+                     *owned, filterColumnView, stream, get_output_mr())
+               : cudf::apply_boolean_mask(
+                     input, filterColumnView, stream, get_output_mr());
 }
 
 std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
@@ -333,6 +353,14 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   for (auto& col : inputTableColumns) {
     inputViews.push_back(col->view());
   }
+  return project(inputViews, &inputTableColumns, numRows, stream);
+}
+
+std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
+    const std::vector<cudf::column_view>& inputViews,
+    std::vector<std::unique_ptr<cudf::column>>* owned,
+    cudf::size_type numRows,
+    cuda::stream_ref stream) {
   std::vector<ColumnOrView> columns;
   for (auto& projectEvaluator : projectEvaluators_) {
     columns.push_back(
@@ -370,15 +398,14 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
 
   // identityProjections (input to output copy)
   for (auto const& identity : identityProjections_) {
-    VELOX_CHECK_NOT_NULL(inputTableColumns[identity.inputChannel]);
-    if (inputChannelCount[identity.inputChannel] == 1) {
+    if (owned && inputChannelCount[identity.inputChannel] == 1) {
       // Move the column if it occurs only once
       outputColumns[identity.outputChannel] =
-          std::move(inputTableColumns[identity.inputChannel]);
+          std::move((*owned)[identity.inputChannel]);
     } else {
       // Otherwise, copy the column and decrement the count
       outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
-          *inputTableColumns[identity.inputChannel], stream, get_output_mr());
+          inputViews[identity.inputChannel], stream, get_output_mr());
     }
     VELOX_CHECK_GT(inputChannelCount[identity.inputChannel], 0);
     inputChannelCount[identity.inputChannel]--;

@@ -73,6 +73,10 @@ class CudfVector : public RowVector, public SharedVector {
   /// Shares immutable device buffers with independent consumer metadata.
   RowVectorPtr shareForRead(memory::MemoryPool* pool) override;
 
+  bool isShared() const {
+    return sharedStorage_ != nullptr;
+  }
+
   cuda::stream_ref stream() const {
     return stream_;
   }
