@@ -87,12 +87,13 @@ TEST_F(LazyVectorTest, selectedFlatMapChildren) {
                   return payload;
                 }));
         values.push_back(
-            rowValues ? VectorPtr(std::make_shared<RowVector>(
-                            pool(),
-                            ROW({"v", "unused"}, {BIGINT(), BIGINT()}),
-                            nullptr,
-                            8,
-                            std::vector<VectorPtr>{lazy, nullptr}))
+            rowValues ? VectorPtr(
+                            std::make_shared<RowVector>(
+                                pool(),
+                                ROW({"v", "unused"}, {BIGINT(), BIGINT()}),
+                                nullptr,
+                                8,
+                                std::vector<VectorPtr>{lazy, nullptr}))
                       : VectorPtr(lazy));
       }
       auto map = std::make_shared<FlatMapVector>(

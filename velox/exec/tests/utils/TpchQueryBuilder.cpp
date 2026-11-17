@@ -32,7 +32,6 @@ constexpr const char* kQ15Revenue =
     "cast(l_extendedprice as decimal(15, 2)) * "
     "(cast(1 as decimal(3, 2)) - cast(l_discount as decimal(3, 2)))";
 
-
 /// DWRF does not support Date type and Varchar is used.
 /// Return the Date filter expression as per data format.
 std::string formatDateFilter(
@@ -2499,7 +2498,8 @@ TpchPlan TpchQueryBuilder::getCtePlan(
   VELOX_USER_CHECK(
       queryId == 2 || queryId == 11 || queryId == 15 || queryId == 17 ||
           queryId == 20 || queryId == 22,
-      "No CTE benchmark plan for Q{}", queryId);
+      "No CTE benchmark plan for Q{}",
+      queryId);
   TpchPlan context;
   context.dataFileFormat = format_;
   auto ids = std::make_shared<core::PlanNodeIdGenerator>();
@@ -2508,9 +2508,13 @@ TpchPlan TpchQueryBuilder::getCtePlan(
                   const std::vector<std::string>& filters = {},
                   const std::string& remaining = "") {
     PlanBuilder builder(ids, pool_.get());
-    builder.filtersAsNode(filtersAsNode_).tableScan(
-        table, getRowType(table, columns), getFileColumnNames(table), filters,
-        remaining);
+    builder.filtersAsNode(filtersAsNode_)
+        .tableScan(
+            table,
+            getRowType(table, columns),
+            getFileColumnNames(table),
+            filters,
+            remaining);
     core::PlanNodeId id;
     builder.captureScanNodeId(id);
     context.dataFiles[id] = getTableFilePaths(table);

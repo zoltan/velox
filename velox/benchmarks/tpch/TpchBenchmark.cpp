@@ -238,12 +238,13 @@ void TpchBenchmark::compareCtePlans(std::ostream& out) {
         }
         if (!FLAGS_cte_plan_directory.empty() && sample == -1) {
           std::filesystem::create_directories(FLAGS_cte_plan_directory);
-          std::ofstream file(fmt::format(
-              "{}/q{}-{}-d{}.txt",
-              FLAGS_cte_plan_directory,
-              query,
-              name,
-              FLAGS_num_drivers));
+          std::ofstream file(
+              fmt::format(
+                  "{}/q{}-{}-d{}.txt",
+                  FLAGS_cte_plan_directory,
+                  query,
+                  name,
+                  FLAGS_num_drivers));
           VELOX_CHECK(file.good());
           file << printPlanWithStats(*plan.plan, stats, true);
         }

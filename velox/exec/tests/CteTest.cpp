@@ -1355,12 +1355,13 @@ TEST_F(CteTest, hashJoinSpillingInProducersAndConsumers) {
           folly::parseJson(folly::toJson(query.build()->serialize())), pool());
       for (int drivers : {1, 64}) {
         for (bool spill : {false, true}) {
-          SCOPED_TRACE(fmt::format(
-              "producerJoin={} type={} drivers={} spill={}",
-              producerJoin,
-              sqlJoin,
-              drivers,
-              spill));
+          SCOPED_TRACE(
+              fmt::format(
+                  "producerJoin={} type={} drivers={} spill={}",
+                  producerJoin,
+                  sqlJoin,
+                  drivers,
+                  spill));
           auto directory = common::testutil::TempDirectoryPath::create();
           TestScopedSpillInjection injection(spill ? 100 : 0);
           auto task =
