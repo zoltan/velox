@@ -208,7 +208,8 @@ Driver counts come from the planned pipelines, not the number of drivers that
 have started executing. A driver that finishes before its peers initialize
 cannot prematurely signal EOF or close their reader. Batch publication and
 claims use a short shared mutex; metadata construction and downstream computation run
-outside it. Runtime metrics ``activeProducerDrivers``
+outside it. Ready/completion polls use atomic snapshots. A reader about to block
+rechecks under the mutex before registering its waiter, preventing lost wakeups. Runtime metrics ``activeProducerDrivers``
 and ``activeReaderDrivers`` count drivers that actually processed data.
 
 This is unordered batch distribution, not preservation of producer partitions
@@ -331,11 +332,18 @@ few row groups may leave many drivers idle.
 cuDF execution
 --------------
 
-With cuDF enabled, shared CTEs whose producer subtrees have supported types use
-GPU-resident batches. The existing shared-result operators and task-local queue
-remain in place. A CPU producer is converted once before publication; unsupported
-producer types retain the CPU path. The saved-plan benchmark registers CTE
-serialization together with the ordinary plan nodes.
+With cuDF enabled, producers publish batches in their input representation.
+Each reader uses the existing conversion operators to match its next consumer.
+Already matching batches are forwarded unchanged. CPU producers with CPU readers
+therefore stay on the host; GPU producers with GPU readers share device bytes.
+Transparent CTE-to-CTE publication preserves the incoming representation.
+The saved-plan benchmark registers CTE serialization with ordinary plan nodes.
+
+A CPU producer feeding multiple GPU readers currently uploads once per reader.
+There is no shared cache of converted CTE payloads. This favors a small boundary
+adapter over coordinated whole-task placement; measure mixed-backend workloads
+before assuming that sharing saves those conversion costs. Small host batches
+retain the existing upload batching policy.
 
 Each reader receives independent ``CudfVector`` metadata referring to the same
 immutable device allocations. Publishing and claiming a batch do not copy its
@@ -346,9 +354,13 @@ storage is shared. Zero-copy sharing does not imply that every downstream
 operator can operate without copying.
 
 A reader changing streams orders its previous stream before its next use. Its
-last stream is joined to the allocation owner's stream before its reference is
-released, so asynchronous reads finish before buffers can be reused. Streams
-must outlive the vectors using them, as for ordinary cuDF execution.
+last stream is joined to a separate reclamation stream before its reference is
+released, so asynchronous reads finish before buffers can be reused. This avoids
+ordering the producer's future work behind its readers, but adds event and
+allocator cross-stream ordering costs. Measure with the deployed RMM resource.
+If CUDA cannot establish safe completion during teardown, storage is retained.
+Consumer streams must outlive their vectors; shared storage owns the reclamation
+stream until its allocation is freed.
 
 Device allocations retain their original memory-resource accounting; reader
 views do not charge the payload again. The existing retained-byte guard includes
@@ -360,3 +372,11 @@ packed and nested buffers, independent consumer streams, cancellation, byte
 limits, CPU fallback, serialization, parallel producer multiplicity and shared
 aggregation/join plans. Input uploads and final result downloads remain necessary
 when the query starts and ends with CPU vectors.
+
+The ``sharedStorageReuse`` test measures repeated device-only publication, two
+consumer streams and final reclamation. Set ``VELOX_CTE_MEMORY_RESOURCE`` to
+``async``, ``pool`` or ``arena`` and ``VELOX_CTE_REUSE_ITERATIONS`` to select the
+sample length. It checks device pointer identity and both consumers' results;
+reported live bytes exclude allocator-reserved capacity. The generic queue's
+``concurrentPolling`` test accepts ``VELOX_CTE_POLL_ITERATIONS`` and exercises
+1, 8, 32 and 64 threads. These are isolated measurements, not query throughput.
