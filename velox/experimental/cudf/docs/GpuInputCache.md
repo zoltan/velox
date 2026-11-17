@@ -5,21 +5,21 @@ It shares a custom memory resource and arbitrator with query operators. Eviction
 releases GPU storage; reconstruction reads through the existing host cache. It
 does not spill operator state or introduce a second host cache implementation.
 
-At application startup, after initializing MemoryManager and cuDF:
+## Enablement
 
-```cpp
-auto resource = createCudfCustomMemoryResource(gpuBudgetBytes, true);
-memory::CustomMemoryResourceRegistry::global().insert(
-    std::string{kCudfMemoryResourceTag}, resource);
-registerCudfMemoryResource(gpuBudgetBytes);
-auto inputCache = std::make_shared<GpuEncodedCache>(resource, *mr_);
-setEncodedInputGpuCache(inputCache);
-```
+Install the CPU `AsyncDataCache` instance and call
+`registerCudfMemoryResource(deviceCapacity)` before `registerCudf()`. Registration
+owns the GPU input cache when the backend enables discardable reclamation.
+Set `CudfConfig::kGpuInputCacheEnabled` (`cudf.gpu_input_cache_enabled`) to `false`
+for CPU-only input caching. A previously installed explicit cache takes priority.
 
-Retain `inputCache` until readers and their input leases are released. Call
-`attachCudfMemoryPool` before creating each query's tasks. Clear the installed
-cache and release it before unregistering cuDF. The backend registration is
-process-lived; its capacity cannot be changed after initialization.
+All GPU queries sharing this backend must use `attachCudfMemoryPool(queryCtx)`
+before task creation. Registration does not attach query pools. The cache and
+query pools share the device budget. An application-supplied backend must enable
+discardable reclamation; registration preserves its policy and capacity.
+Finish all readers and queries before `unregisterCudf()`, which releases the
+registration-owned cache. Host footer inspection may precede query resource
+attachment; the datasource retains file identity during that preparation.
 
 BufferedInputDataSource uses an installed cache automatically when BufferedInput
 has a host cache and the file has a retained immutable identity. Disabling the
@@ -73,19 +73,39 @@ include column names because stripping a PartitionedOutput root can change their
 order relative to SQL output. Validate names and values against the saved output
 schema, preserving row multiplicities.
 
-## Application registration
+## Cold reads and pressure
 
-Install the CPU `AsyncDataCache` instance and call
-`registerCudfMemoryResource(deviceCapacity)` before `registerCudf()`. Registration
-then owns the GPU input cache when the backend enables discardable reclamation.
-Set `CudfConfig::kGpuInputCacheEnabled` (`cudf.gpu_input_cache_enabled`) to `false`
-for CPU-only input caching. A previously installed explicit cache takes priority.
+The datasource reserves all ranges before submitting reads. Adjacent cache
+misses share a host read; independent groups are submitted to the IO executor
+before returning a pending batch. The producer publishes each completed fill,
+so another consumer can wait independently. The batch retains host buffers
+until their uploads finish and drains every accepted read on failure or
+abandonment. A rejected submission discards unpublished destinations after
+accepted work completes. Successful groups remain cached for retry.
 
-All GPU queries sharing this backend must use `attachCudfMemoryPool(queryCtx)`
-before task creation, as required by GPU memory accounting. The cache and query
-pools share the same device budget. Registration does not attach query pools.
-A backend supplied by the application must enable discardable reclamation;
-registration preserves its policy. Finish all readers and queries before
-`unregisterCudf()`, which unpublishes and releases the registration-owned cache.
-Host footer inspection may precede query resource attachment; file identity is
-retained at datasource creation and device fetching uses the later resources.
+When admission is refused, the cache may evict its own idle entries and retry
+once. Global query waiters take priority over new cache admissions. Pinned
+entries remain valid. Discardable pools are never arbitration abort victims;
+if an explicit abort or a reclaim exception aborts the cache, admission is
+disabled, idle entries are released, and future reads use the normal copy path.
+Physical allocation recovery has separate request, duration and capacity
+counters in `SharedArbitrator::discardableRecoveryStats()`.
+
+## cuDF failure regression dependency
+
+`VELOX_CUDF_TEST_READ_COMPLETION_FIX` defaults to `OFF`. Enable it only when
+building against cuDF with the accepted-read completion fix; it registers the
+isolated read/copy failure regression executables. The current pinned cuDF fails
+these tests. The gate keeps default CI honest; it does not remove the cache's
+cuDF dependency for cancellation and exceptional read completion. Production
+cache deployment must include that fix until the dependency pin contains it.
+
+## Relationship to the host cache
+
+This is a device-resident reuse layer above OSS `AsyncDataCache`. Device input
+needs contiguous allocations and CUDA stream completion to govern reclamation.
+The host cache keeps its own statistics, TTL and SSD policy. Evicting a GPU entry
+only releases its device allocation; the existing BufferedInput path reconstructs
+it from host cache or storage. The cache does not implement operator spilling.
+The memory library depends on `velox_exec` for driver suspension hooks; it sits
+below cuDF readers and operators, not below all of Velox execution.
