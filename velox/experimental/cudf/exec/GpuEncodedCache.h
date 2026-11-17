@@ -65,6 +65,8 @@ class GpuEncodedCache : public std::enable_shared_from_this<GpuEncodedCache> {
     void* data{nullptr};
     cudaEvent_t ready{};
     State state{State::Filling};
+    // Publish the destination before asynchronous host reads complete.
+    bool allocated{false};
     std::condition_variable filled;
     Completions consumers;
     Queue::iterator position;
@@ -124,6 +126,13 @@ class GpuEncodedCache : public std::enable_shared_from_this<GpuEncodedCache> {
       entry_ = std::move(entry);
     }
     void prepareCompletion();
+    /// Wait for host submission of this entry's fill, propagating failure.
+    void waitForFill();
+    /// Publish a reservation after all writes have been enqueued on its stream.
+    void completeFill();
+    /// Drain writes and discard an unpublished reservation after a read
+    /// failure.
+    void failFill();
     ~Lease();
     Lease(const Lease&) = delete;
     Lease& operator=(const Lease&) = delete;
@@ -167,6 +176,15 @@ class GpuEncodedCache : public std::enable_shared_from_this<GpuEncodedCache> {
       cudaStream_t stream,
       const std::function<void(void*)>& fill,
       std::shared_ptr<const void> sourceIdentity = nullptr);
+  /// Reserve a destination for asynchronous filling. Set needsFill only for
+  /// the creator, which must call completeFill() or failFill() on its lease.
+  /// Other callers wait for allocation only; call waitForFill() before use.
+  LeasePtr reserve(
+      const std::string& key,
+      uint64_t bytes,
+      cudaStream_t stream,
+      std::shared_ptr<const void> sourceIdentity,
+      bool& needsFill);
   /// Pin an existing entry, or return nullptr on a miss or concurrent eviction.
   LeasePtr get(const std::string& key, cudaStream_t stream) {
     return access(key, 0, stream, nullptr);
@@ -195,7 +213,8 @@ class GpuEncodedCache : public std::enable_shared_from_this<GpuEncodedCache> {
       uint64_t bytes,
       cudaStream_t stream,
       const std::function<void(void*)>* fill,
-      std::shared_ptr<const void> sourceIdentity = nullptr);
+      std::shared_ptr<const void> sourceIdentity = nullptr,
+      bool* needsFill = nullptr);
   void release(
       const std::shared_ptr<Entry>& entry,
       cudaStream_t stream,

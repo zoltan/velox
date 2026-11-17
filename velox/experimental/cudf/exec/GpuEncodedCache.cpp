@@ -85,6 +85,68 @@ GpuEncodedCache::Lease::~Lease() {
     owner_->release(entry_, stream_, completion_);
 }
 
+void GpuEncodedCache::Lease::waitForFill() {
+  auto& shard = owner_->shardFor(entry_->key);
+  {
+    std::lock_guard lock(shard.mutex);
+    if (entry_->state == State::Ready) {
+      return;
+    }
+  }
+  exec::suspendDriverForMemoryArbitration();
+  SCOPE_EXIT {
+    exec::resumeDriverAfterMemoryArbitration();
+  };
+  std::unique_lock lock(shard.mutex);
+  entry_->filled.wait(lock, [&] { return entry_->state != State::Filling; });
+  VELOX_CHECK(entry_->state == State::Ready, "Cached input fill failed");
+}
+
+void GpuEncodedCache::Lease::completeFill() {
+  ensureCudaContextForThread();
+  check(cudaEventRecord(entry_->ready, stream_));
+  auto& shard = owner_->shardFor(entry_->key);
+  {
+    Lock lock(*owner_, shard);
+    VELOX_CHECK(entry_->state == State::Filling);
+    entry_->state = State::Ready;
+    owner_->admitted_ += entry_->bytes;
+  }
+  entry_->filled.notify_all();
+}
+
+void GpuEncodedCache::Lease::failFill() {
+  ensureCudaContextForThread();
+  {
+    auto& shard = owner_->shardFor(entry_->key);
+    Lock lock(*owner_, shard);
+    if (entry_->state != State::Filling) {
+      return;
+    }
+  }
+  // A failed read may already have submitted writes to this destination.
+  if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+    std::terminate();
+  }
+  owner_->reporting_->deallocate(
+      cuda::stream_ref{stream_},
+      entry_->data,
+      entry_->bytes,
+      alignof(std::max_align_t));
+  cudaEventDestroy(entry_->ready);
+  auto& shard = owner_->shardFor(entry_->key);
+  {
+    Lock lock(*owner_, shard);
+    entry_->data = nullptr;
+    entry_->ready = nullptr;
+    entry_->state = State::Failed;
+    shard.entries.erase(entry_->key);
+    shard.pinned.erase(entry_->position);
+    ++owner_->fillErrors_;
+  }
+  entry_->filled.notify_all();
+}
+
 void GpuEncodedCache::Lease::waitForFillOn(cudaStream_t stream) {
   check(cudaStreamWaitEvent(stream, entry_->ready, 0));
   stream_ = stream;
@@ -132,6 +194,18 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::getOrFill(
     const std::function<void(void*)>& fill,
     std::shared_ptr<const void> sourceIdentity) {
   return access(key, bytes, stream, &fill, std::move(sourceIdentity));
+}
+
+GpuEncodedCache::LeasePtr GpuEncodedCache::reserve(
+    const std::string& key,
+    uint64_t bytes,
+    cudaStream_t stream,
+    std::shared_ptr<const void> sourceIdentity,
+    bool& needsFill) {
+  needsFill = false;
+  const std::function<void(void*)> deferredFill;
+  return access(
+      key, bytes, stream, &deferredFill, std::move(sourceIdentity), &needsFill);
 }
 
 uint64_t GpuEncodedCache::evict(uint64_t target) {
@@ -244,7 +318,8 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
     uint64_t bytes,
     cudaStream_t stream,
     const std::function<void(void*)>* fill,
-    std::shared_ptr<const void> sourceIdentity) {
+    std::shared_ptr<const void> sourceIdentity,
+    bool* needsFill) {
   std::call_once(bindOnce_, [&] {
     static_cast<Reclaimer*>(root_->reclaimer())->bind(weak_from_this());
   });
@@ -324,8 +399,10 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
           };
           // Destroy this lock before resuming, which may wait for a task pause.
           std::unique_lock waitLock(shard.mutex);
-          entry->filled.wait(
-              waitLock, [&] { return entry->state != State::Filling; });
+          entry->filled.wait(waitLock, [&] {
+            return entry->state != State::Filling ||
+                (needsFill && entry->allocated);
+          });
           if (entry->state == State::Failed) {
             --entry->pins;
             lease.setEntry(nullptr);
@@ -333,7 +410,9 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
           }
         }
         lease.prepareCompletion();
-        check(cudaStreamWaitEvent(stream, entry->ready, 0));
+        if (!needsFill) {
+          check(cudaStreamWaitEvent(stream, entry->ready, 0));
+        }
         return std::make_shared<Lease>(std::move(lease));
       }
     }
@@ -368,8 +447,10 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
         }
       }
       check(cudaEventCreateWithFlags(&entry->ready, cudaEventDisableTiming));
-      (*fill)(entry->data);
-      check(cudaEventRecord(entry->ready, stream));
+      if (!needsFill) {
+        (*fill)(entry->data);
+        check(cudaEventRecord(entry->ready, stream));
+      }
     } catch (...) {
       const bool submitted = entry->data != nullptr;
       // A partially submitted fill may still touch its destination.
@@ -422,15 +503,29 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
     }
     {
       Lock lock(*this, shard);
-      entry->state = State::Ready;
-      admitted_ += bytes;
+      entry->allocated = true;
+      if (needsFill) {
+        *needsFill = true;
+      } else {
+        entry->state = State::Ready;
+        admitted_ += bytes;
+      }
     }
     entry->filled.notify_all();
   } else {
     lease.prepareCompletion();
   }
-  check(cudaStreamWaitEvent(stream, entry->ready, 0));
-  return std::make_shared<Lease>(std::move(lease));
+  if (!needsFill) {
+    check(cudaStreamWaitEvent(stream, entry->ready, 0));
+  }
+  try {
+    return std::make_shared<Lease>(std::move(lease));
+  } catch (...) {
+    if (needsFill && *needsFill) {
+      lease.failFill();
+    }
+    throw;
+  }
 }
 
 void GpuEncodedCache::release(

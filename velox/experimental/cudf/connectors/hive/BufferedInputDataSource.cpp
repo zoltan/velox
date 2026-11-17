@@ -173,11 +173,81 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
     rmm::device_async_resource_ref temporaryResource) {
   struct Owner {
     std::shared_ptr<BufferedInputDataSource> source;
-    std::vector<gpu::DeviceReadBatch> reads;
+    std::vector<GpuEncodedCache::LeasePtr> leases;
+    std::vector<bool> created;
+    std::vector<std::future<size_t>> pending;
+    std::vector<size_t> expected;
+    std::vector<std::shared_ptr<std::unique_ptr<buffer>>> hostBuffers;
+    cuda::stream_ref stream;
+    explicit Owner(cuda::stream_ref value) : stream(value) {}
+    gpu::DeviceReadBatch bypass;
+    std::exception_ptr error;
+    bool finished{false};
+
+    void finish() {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      // Drain every accepted read before releasing any destination, preserving
+      // the first failure even if a later read also fails.
+      for (size_t i = 0; i < pending.size(); ++i) {
+        try {
+          VELOX_CHECK_EQ(
+              pending[i].get(), expected[i], "Short cached input read");
+        } catch (...) {
+          if (!error) {
+            error = std::current_exception();
+          }
+        }
+      }
+      try {
+        bypass.wait();
+      } catch (...) {
+        if (!error) {
+          error = std::current_exception();
+        }
+      }
+      if (!hostBuffers.empty()) {
+        ensureCudaContextForThread();
+        // Retain even pinned host buffers until every accepted upload finishes.
+        if (cudaStreamSynchronize(stream.get()) != cudaSuccess) {
+          std::terminate();
+        }
+        hostBuffers.clear();
+      }
+      if (error) {
+        for (size_t i = 0; i < leases.size(); ++i) {
+          if (created[i]) {
+            leases[i]->failFill();
+          }
+        }
+      }
+      if (error) {
+        std::rethrow_exception(error);
+      }
+      for (auto& lease : leases) {
+        if (lease) {
+          lease->waitForFill();
+        }
+      }
+    }
+
+    ~Owner() {
+      try {
+        finish();
+      } catch (...) {
+        // Explicit completion reports failures. Abandonment still drains reads.
+      }
+    }
   };
-  auto owner = std::make_shared<Owner>();
+  auto owner = std::make_shared<Owner>(stream);
   owner->source = shared_from_this();
-  owner->reads.reserve(ranges.size() + 1);
+  owner->leases.resize(ranges.size());
+  owner->created.resize(ranges.size());
+  owner->pending.reserve(ranges.size());
+  owner->expected.reserve(ranges.size());
+  owner->hostBuffers.reserve(ranges.size());
   gpu::DeviceReadBatch result;
   result.owner = owner;
   result.data.resize(ranges.size());
@@ -185,69 +255,147 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
   std::vector<size_t> bypassIndices;
   bypass.reserve(ranges.size());
   bypassIndices.reserve(ranges.size());
-  for (size_t i = 0; i < ranges.size(); ++i) {
-    const auto& range = ranges[i];
-    VELOX_CHECK_GE(range.offset(), 0);
-    VELOX_CHECK_GE(range.size(), 0);
-    VELOX_CHECK_LE(range.offset(), size());
-    VELOX_CHECK_LE(range.size(), size() - range.offset());
-    if (range.size() == 0) {
-      continue;
-    }
-    recordBytes("cudfGpuCacheEligibleBytes", range.size());
-    const auto key = fmt::format(
-        "parquet:{}:{}:{}", fileIdentity_->id(), range.offset(), range.size());
-    // Decoder loads can read the final 64-bit word past the logical tail.
-    constexpr uint64_t kDecoderWordBytes = sizeof(uint64_t);
-    const auto padding =
-        (kDecoderWordBytes - range.size() % kDecoderWordBytes) %
-        kDecoderWordBytes;
-    auto cached = readCachedDeviceRange(
-        deviceCache_,
-        key,
-        range.size(),
-        padding,
-        stream,
-        [&](void* destination) {
-          VELOX_CHECK_EQ(
-              device_read_async(
-                  range.offset(),
-                  range.size(),
-                  static_cast<uint8_t*>(destination),
-                  stream)
-                  .get(),
-              range.size());
-        },
-        fileIdentity_);
-    if (cached.batch) {
-      result.data[i] = gpu::DeviceByteView{
-          cached.batch.data.front().data(), static_cast<size_t>(range.size())};
-      owner->reads.push_back(std::move(cached.batch));
-      recordBytes(
-          cached.outcome == DeviceCacheOutcome::Fill ? "cudfGpuCacheFillBytes"
-                                                     : "cudfGpuCacheHitBytes",
+  try {
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      const auto& range = ranges[i];
+      VELOX_CHECK_GE(range.offset(), 0);
+      VELOX_CHECK_GE(range.size(), 0);
+      VELOX_CHECK_LE(range.offset(), size());
+      VELOX_CHECK_LE(range.size(), size() - range.offset());
+      if (range.size() == 0) {
+        continue;
+      }
+      recordBytes("cudfGpuCacheEligibleBytes", range.size());
+      const auto key = fmt::format(
+          "parquet:{}:{}:{}",
+          fileIdentity_->id(),
+          range.offset(),
           range.size());
-    } else {
-      bypass.emplace_back(range.offset(), range.size());
-      bypassIndices.push_back(i);
-      recordBytes("cudfGpuCacheBypassBytes", range.size());
+      constexpr uint64_t kDecoderWordBytes = sizeof(uint64_t);
+      const auto padding =
+          (kDecoderWordBytes - range.size() % kDecoderWordBytes) %
+          kDecoderWordBytes;
+      bool needsFill{false};
+      owner->leases[i] = deviceCache_->reserve(
+          key, range.size() + padding, stream.get(), fileIdentity_, needsFill);
+      owner->created[i] = needsFill;
+      if (auto& lease = owner->leases[i]) {
+        result.data[i] = gpu::DeviceByteView{
+            static_cast<const uint8_t*>(lease->data()),
+            static_cast<size_t>(range.size())};
+        if (needsFill && padding) {
+          CUDF_CUDA_TRY(cudaMemsetAsync(
+              static_cast<uint8_t*>(lease->data()) + range.size(),
+              0,
+              padding,
+              stream.get()));
+        }
+        recordBytes(
+            needsFill ? "cudfGpuCacheFillBytes" : "cudfGpuCacheHitBytes",
+            range.size());
+      } else {
+        bypass.emplace_back(range.offset(), range.size());
+        bypassIndices.push_back(i);
+        recordBytes("cudfGpuCacheBypassBytes", range.size());
+      }
     }
-  }
-  if (!bypass.empty()) {
-    auto copied = copyByteRangesAsync(
-        shared_from_this(),
-        {bypass.data(), bypass.size()},
-        serializeSubmissions,
-        stream,
-        {outputResource, temporaryResource});
-    for (size_t i = 0; i < bypassIndices.size(); ++i) {
-      result.data[bypassIndices[i]] = copied.data[i];
+
+    // Coalesce adjacent misses into host reads, then scatter directly into the
+    // retained destinations. Submit every group before waiting for completion.
+    static std::mutex submissionMutex;
+    std::unique_lock submissionLock(submissionMutex, std::defer_lock);
+    if (serializeSubmissions) {
+      submissionLock.lock();
     }
-    result.pending = std::move(copied.pending);
-    owner->reads.push_back(std::move(copied));
+    for (size_t i = 0; i < ranges.size();) {
+      if (!owner->created[i]) {
+        ++i;
+        continue;
+      }
+      const auto offset = ranges[i].offset();
+      size_t bytes = ranges[i].size();
+      std::vector<std::pair<void*, size_t>> destinations{
+          {owner->leases[i]->data(), static_cast<size_t>(ranges[i].size())}};
+      size_t end = i + 1;
+      while (end < ranges.size() && owner->created[end] &&
+             ranges[end].offset() == offset + bytes) {
+        destinations.emplace_back(
+            owner->leases[end]->data(), ranges[end].size());
+        bytes += ranges[end].size();
+        ++end;
+      }
+      std::vector<GpuEncodedCache::LeasePtr> fillLeases(
+          owner->leases.begin() + i, owner->leases.begin() + end);
+      auto retainedBuffer = std::make_shared<std::unique_ptr<buffer>>();
+      owner->hostBuffers.push_back(retainedBuffer);
+      owner->expected.push_back(bytes);
+      owner->pending.push_back(submitDeviceRead(
+          input_->executor(),
+          [source = owner->source,
+           offset,
+           bytes,
+           destinations = std::move(destinations),
+           stream,
+           retainedBuffer,
+           fillLeases = std::move(fillLeases)] {
+            try {
+              auto& buffer = *retainedBuffer;
+              buffer = source->host_read(offset, bytes);
+              VELOX_CHECK_EQ(buffer->size(), bytes, "Short cached input read");
+              ensureCudaContextForThread();
+              size_t consumed{0};
+              for (const auto& [destination, length] : destinations) {
+                CUDF_CUDA_TRY(cudaMemcpyAsync(
+                    destination,
+                    buffer->data() + consumed,
+                    length,
+                    cudaMemcpyDefault,
+                    stream.get()));
+                consumed += length;
+              }
+              source->recordBytes("cudfInputH2DBytes", bytes);
+              // Publish on the producer, even if its consumer has not waited
+              // yet. Other queries sharing a fill must not depend on that
+              // consumer.
+              for (const auto& lease : fillLeases) {
+                lease->completeFill();
+              }
+              return bytes;
+            } catch (...) {
+              for (const auto& lease : fillLeases) {
+                lease->failFill();
+              }
+              throw;
+            }
+          }));
+      i = end;
+    }
+    if (!bypass.empty()) {
+      owner->bypass = copyByteRangesAsync(
+          shared_from_this(),
+          {bypass.data(), bypass.size()},
+          serializeSubmissions,
+          stream,
+          {outputResource, temporaryResource});
+      for (size_t i = 0; i < bypassIndices.size(); ++i) {
+        result.data[bypassIndices[i]] = owner->bypass.data[i];
+      }
+    }
+    result.pending =
+        std::async(std::launch::deferred, [owner] { owner->finish(); });
+    result.ready = [owner](cuda::stream_ref consumer) {
+      for (const auto& lease : owner->leases) {
+        if (lease) {
+          lease->waitForFillOn(consumer.get());
+        }
+      }
+      owner->bypass.waitOn(consumer);
+    };
+    return result;
+  } catch (...) {
+    owner->error = std::current_exception();
+    throw;
   }
-  // All views are consumed on the supplied stream, matching the copy adapter.
-  return result;
 }
 
 bool BufferedInputDataSource::supports_device_read() const {
