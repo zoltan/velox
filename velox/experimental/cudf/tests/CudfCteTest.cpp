@@ -62,6 +62,10 @@ class CudfCteTest : public OperatorTestBase {
  protected:
   void SetUp() override {
     OperatorTestBase::SetUp();
+    savedResource_ = CudfConfig::getInstance().memoryResource;
+    if (const auto* resource = std::getenv("VELOX_CTE_MEMORY_RESOURCE")) {
+      CudfConfig::getInstance().memoryResource = resource;
+    }
     savedFallback_ = CudfConfig::getInstance().allowCpuFallback;
     CudfConfig::getInstance().allowCpuFallback = false;
     registerCudf();
@@ -73,9 +77,11 @@ class CudfCteTest : public OperatorTestBase {
   void TearDown() override {
     unregisterCudf();
     CudfConfig::getInstance().allowCpuFallback = savedFallback_;
+    CudfConfig::getInstance().memoryResource = savedResource_;
     OperatorTestBase::TearDown();
   }
   bool savedFallback_;
+  std::string savedResource_;
 };
 
 TEST_F(CudfCteTest, sharedProjectionDoesNotCopyUnusedColumns) {
@@ -180,6 +186,76 @@ TEST_F(CudfCteTest, sharedFilterAndProjectionPreserveInput) {
             fmt::format(
                 "SELECT c0, c0, c1 + 1 FROM tmp WHERE {} UNION ALL SELECT c0, c0, c1 FROM tmp",
                 predicate));
+  }
+}
+
+// Device-only allocation/copy/publication/release cycle. The two consumer
+// streams read the shared payload before the next iteration reuses pool space.
+TEST_F(CudfCteTest, sharedStorageReuse) {
+  constexpr vector_size_t kRows = 1 << 18;
+  const int iterations = std::getenv("VELOX_CTE_REUSE_ITERATIONS")
+      ? std::max(1, std::atoi(std::getenv("VELOX_CTE_REUSE_ITERATIONS")))
+      : 8;
+  cuda::stream producer{cuda::device_ref{0}};
+  cuda::stream first{cuda::device_ref{0}};
+  cuda::stream second{cuda::device_ref{0}};
+  auto host =
+      makeRowVector({makeFlatVector<int64_t>(kRows, [](auto i) { return i; })});
+  auto source =
+      with_arrow::toCudfTable(host, pool(), producer, get_output_mr());
+  std::array<rmm::device_buffer, 2> copies{
+      rmm::device_buffer(kRows * sizeof(int64_t), first, get_output_mr()),
+      rmm::device_buffer(kRows * sizeof(int64_t), second, get_output_mr())};
+  producer.sync();
+  first.sync();
+  second.sync();
+  statsMr_->push_counters();
+  const auto begin = std::chrono::steady_clock::now();
+  for (int i = 0; i < iterations; ++i) {
+    auto table = std::make_unique<cudf::table>(
+        source->view(), producer, get_output_mr());
+    auto original = std::make_shared<CudfVector>(
+        pool(), host->type(), kRows, std::move(table), producer);
+    for (int reader = 0; reader < 2; ++reader) {
+      auto shared =
+          std::dynamic_pointer_cast<CudfVector>(original->shareForRead(pool()));
+      cuda::stream_ref stream = reader == 0 ? first : second;
+      ASSERT_TRUE(shared->rebindStream(stream));
+      EXPECT_EQ(
+          shared->getTableView().column(0).head<int64_t>(),
+          original->getTableView().column(0).head<int64_t>());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          copies[reader].data(),
+          shared->getTableView().column(0).head<int64_t>(),
+          copies[reader].size(),
+          cudaMemcpyDeviceToDevice,
+          stream.get()));
+    }
+  }
+  // Include final reclamation stream completion, as well as consumer copies.
+  CUDF_CUDA_TRY(cudaDeviceSynchronize());
+  const auto seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
+          .count();
+  const auto counters = statsMr_->pop_counters().first;
+  std::cout << "CTE_REUSE resource=" << CudfConfig::getInstance().memoryResource
+            << " iterations=" << iterations << " seconds=" << seconds
+            << " peak_increment=" << counters.peak
+            << " live=" << cudfAllocatedBytes() << std::endl;
+  std::vector<int64_t> result(kRows);
+  for (int reader = 0; reader < 2; ++reader) {
+    auto& copy = copies[reader];
+    cuda::stream_ref stream = reader == 0 ? first : second;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        result.data(),
+        copy.data(),
+        copy.size(),
+        cudaMemcpyDeviceToHost,
+        stream.get()));
+    stream.sync();
+    for (int i = 0; i < kRows; ++i) {
+      ASSERT_EQ(result[i], i);
+    }
   }
 }
 
