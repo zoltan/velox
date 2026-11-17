@@ -172,6 +172,37 @@ TEST_F(CudfCteTest, sharedFilterAndProjectionPreserveInput) {
   }
 }
 
+TEST_F(CudfCteTest, readerReleaseDoesNotBlockProducerStream) {
+  cuda::stream producer{cuda::device_ref{0}};
+  cuda::stream consumer{cuda::device_ref{0}};
+  auto host = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto table = with_arrow::toCudfTable(
+      host, pool(), producer, cudf::get_current_device_resource_ref());
+  auto original = std::make_shared<CudfVector>(
+      pool(), host->type(), host->size(), std::move(table), producer);
+  auto reader =
+      std::dynamic_pointer_cast<CudfVector>(original->shareForRead(pool()));
+  ASSERT_TRUE(reader->rebindStream(consumer));
+  std::promise<void> unblock;
+  auto gate = unblock.get_future();
+  CUDF_CUDA_TRY(cudaLaunchHostFunc(
+      consumer.get(),
+      [](void* value) { static_cast<std::future<void>*>(value)->wait(); },
+      &gate));
+  reader.reset();
+  cudaEvent_t marker;
+  CUDF_CUDA_TRY(cudaEventCreateWithFlags(&marker, cudaEventDisableTiming));
+  CUDF_CUDA_TRY(cudaEventRecord(marker, producer.get()));
+  auto completion = std::async(
+      std::launch::async, [marker] { return cudaEventSynchronize(marker); });
+  const auto status = completion.wait_for(std::chrono::seconds(2));
+  unblock.set_value();
+  EXPECT_EQ(completion.get(), cudaSuccess);
+  EXPECT_EQ(status, std::future_status::ready);
+  cudaEventDestroy(marker);
+  consumer.sync();
+}
+
 TEST_F(CudfCteTest, zeroCopyBuffer) {
   cuda::stream stream{cuda::device_ref{0}};
   auto host = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
@@ -200,7 +231,8 @@ TEST_F(CudfCteTest, zeroCopyBuffer) {
   buffer->finish();
   buffer.reset();
   // An exclusive-ownership consumer must not steal another reader's storage.
-  auto owned = first->release();
+  VELOX_ASSERT_THROW(first->release(), "requires a destination resource");
+  auto owned = first->release(get_output_mr());
   first.reset();
   EXPECT_NE(owned->view().column(0).head<int64_t>(), address);
   EXPECT_EQ(second->getTableView().column(0).head<int64_t>(), address);

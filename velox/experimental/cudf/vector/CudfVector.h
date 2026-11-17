@@ -71,6 +71,7 @@ class CudfVector : public RowVector, public SharedVector {
   ~CudfVector() override;
 
   /// Shares immutable device buffers with independent consumer metadata.
+  /// Final deallocation uses a separate stream, retained by the shared payload.
   RowVectorPtr shareForRead(memory::MemoryPool* pool) override;
 
   bool isShared() const {
@@ -87,7 +88,8 @@ class CudfVector : public RowVector, public SharedVector {
   /// Releases ownership of the underlying table. Shared storage is copied on
   /// the consumer stream so other readers retain their original buffers.
   /// If constructed from packed_table, materializes a table from the view
-  /// first (which copies the data). Throws if called more than once.
+  /// first (which copies the data). Shared storage requires the explicit
+  /// destination overload. Throws if called more than once.
   std::unique_ptr<cudf::table> release();
 
   /// Uses 'destination' for copies required to obtain exclusive ownership.

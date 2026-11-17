@@ -27,9 +27,12 @@
 #include <cudf/column/column_stream.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime_api.h>
+
+#include <atomic>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -51,6 +54,21 @@ cudaError_t joinStreams(cuda::stream_ref source, cuda::stream_ref destination) {
   }
   const auto destroyStatus = cudaEventDestroy(event);
   return status == cudaSuccess ? destroyStatus : status;
+}
+
+// Reuse a stream per publication thread without putting consumer waits on a
+// producer's compute stream. Each payload retains the stream across thread
+// exit.
+std::shared_ptr<rmm::cuda_stream> reclamationStream() {
+  static thread_local int cachedDevice = -1;
+  static thread_local std::shared_ptr<rmm::cuda_stream> cachedStream;
+  int device;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  if (!cachedStream || device != cachedDevice) {
+    cachedStream = std::make_shared<rmm::cuda_stream>();
+    cachedDevice = device;
+  }
+  return cachedStream;
 }
 
 void rebindTable(std::unique_ptr<cudf::table>& table, cuda::stream_ref stream) {
@@ -82,8 +100,23 @@ bool hasStorage(const TableStorage& storage) {
 } // namespace
 
 struct CudfVector::SharedStorage {
+  // Destroy the table before the stream on which its buffers are freed.
+  std::shared_ptr<rmm::cuda_stream> releaseStream{reclamationStream()};
   TableStorage table;
-  const cuda::stream_ref stream;
+  std::atomic<bool> unsafeToFree{false};
+
+  cuda::stream_ref stream() const {
+    return *releaseStream;
+  }
+
+  ~SharedStorage() {
+    if (unsafeToFree.load()) {
+      // A failed CUDA context cannot prove that readers have stopped using
+      // storage. Keep the allocations alive rather than aborting in teardown
+      // or freeing bytes still referenced by outstanding device work.
+      std::visit([](auto& storage) { storage.release(); }, table);
+    }
+  }
 };
 
 CudfVector::~CudfVector() {
@@ -94,14 +127,18 @@ void CudfVector::releaseShared() noexcept {
   if (!sharedStorage_) {
     return;
   }
-  const auto status = joinStreams(stream_, sharedStorage_->stream);
+  const auto status = joinStreams(stream_, sharedStorage_->stream());
   if (status != cudaSuccess) {
     // Destruction cannot throw. Keep buffers alive until the outstanding use
     // completes if event creation/recording fails (e.g. during cancellation).
     LOG(ERROR) << "Cannot order shared device storage release: "
                << cudaGetErrorString(status);
     const auto waitStatus = cudaStreamSynchronize(stream_.get());
-    CHECK_EQ(waitStatus, cudaSuccess);
+    if (waitStatus != cudaSuccess) {
+      LOG(ERROR) << "Retaining shared storage after failed CUDA completion: "
+                 << cudaGetErrorString(waitStatus);
+      sharedStorage_->unsafeToFree.store(true);
+    }
   }
   sharedStorage_.reset();
 }
@@ -122,21 +159,23 @@ CudfVector::CudfVector(
 
 RowVectorPtr CudfVector::shareForRead(memory::MemoryPool* pool) {
   if (!sharedStorage_) {
-    // Publication is exclusive. Put every allocation on the owner's stream
-    // once, before any concurrent reader can observe the immutable table.
+    auto storage = std::make_shared<SharedStorage>();
+    CUDF_CUDA_TRY(joinStreams(stream_, storage->stream()));
+    // Publication is exclusive. Bind allocation cleanup once, before readers
+    // observe the immutable table. Readiness stays on the producer stream.
     if (auto* table =
             std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
       VELOX_CHECK_NOT_NULL(*table, "Cannot share released device storage");
-      rebindTable(*table, stream_);
+      rebindTable(*table, storage->stream());
       tabView_ = (*table)->view();
     } else {
       auto& packed =
           std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
       VELOX_CHECK_NOT_NULL(packed, "Cannot share released device storage");
-      packed->data.gpu_data->set_stream(stream_);
+      packed->data.gpu_data->set_stream(storage->stream());
     }
-    sharedStorage_ = std::make_shared<SharedStorage>(
-        SharedStorage{std::move(tableStorage_), stream_});
+    storage->table = std::move(tableStorage_);
+    sharedStorage_ = std::move(storage);
   }
   auto snapshot = std::shared_ptr<CudfVector>(new CudfVector(
       pool, type(), size(), sharedStorage_, tabView_, flatSize_, stream_));
@@ -197,6 +236,8 @@ cudf::table_view CudfVector::getTableView() const {
 }
 
 std::unique_ptr<cudf::table> CudfVector::release() {
+  VELOX_CHECK(
+      !sharedStorage_, "Shared device storage requires a destination resource");
   const auto* packed =
       std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_);
   return release(

@@ -132,6 +132,13 @@ velox_add_cudf_test(
   LIBS velox_cudf_vector velox_vector_test_lib cudf::cudf gmock
 )
 
+# CUDA failure overrides stay in their own executable and re-exec per case.
+velox_add_cudf_test(
+  NAME velox_cudf_vector_failure_test
+  SOURCES Main.cpp CudfVectorFailureTest.cpp
+  LIBS CUDA::cudart ${CUDF_TEST_DEFAULT_LIBS} ${CMAKE_DL_LIBS}
+)
+
 velox_add_cudf_test(
   NAME velox_cudf_decimal_expression_test
   SOURCES Main.cpp DecimalExpressionTest.cpp
