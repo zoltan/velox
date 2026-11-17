@@ -683,7 +683,7 @@ TEST_F(GpuInputCacheTest, rejectedSubmissionDrainsAcceptedReads) {
   EXPECT_EQ(cache->evict(0), 16);
 }
 
-TEST_F(GpuInputCacheTest, sharedAsyncFillDoesNotWaitForFirstConsumer) {
+TEST_F(GpuInputCacheTest, concurrentAsyncFillBypassesUnfinishedProducer) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
   auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
@@ -717,8 +717,51 @@ TEST_F(GpuInputCacheTest, sharedAsyncFillDoesNotWaitForFirstConsumer) {
       waiter.wait_for(std::chrono::seconds(5)), std::future_status::ready);
   first.wait();
   waiter.get();
-  EXPECT_EQ(first.data[0].data(), second.data[0].data());
-  EXPECT_EQ(source->reads.size(), 1);
+  EXPECT_NE(first.data[0].data(), second.data[0].data());
+  EXPECT_EQ(source->reads.size(), 2);
+}
+
+TEST_F(GpuInputCacheTest, failedFillDoesNotFailAnotherReader) {
+  auto resource = createCudfCustomMemoryResource(128L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  setEncodedInputGpuCache(cache);
+  SCOPE_EXIT {
+    setEncodedInputGpuCache(nullptr);
+  };
+  auto pool = memory::memoryManager()->addLeafPool();
+  StringIdMap ids;
+  folly::ManualExecutor executor;
+  auto input = std::make_shared<CacheableInput>(
+      std::make_shared<InMemoryReadFile>(std::string(32, 'x')),
+      *pool,
+      true,
+      &executor);
+  auto identity = std::make_shared<StringIdLease>(ids, "isolated-failure");
+  auto producer =
+      std::make_shared<RecordingInputSource>(input, nullptr, identity);
+  auto reader =
+      std::make_shared<RecordingInputSource>(input, nullptr, identity);
+  producer->failOffset = 0;
+  rmm::cuda_stream firstStream, secondStream;
+  rmm::device_async_resource_ref mr{upstream};
+  const std::array<gpu::DeviceByteRange, 1> ranges{{{0, 4}}};
+  auto first =
+      producer->readDeviceRangesAsync(ranges, false, firstStream, mr, mr);
+  auto second =
+      reader->readDeviceRangesAsync(ranges, false, secondStream, mr, mr);
+  EXPECT_THROW(first.wait(), std::runtime_error);
+  ASSERT_NO_THROW(second.waitOn(secondStream));
+  uint8_t byte{0};
+  GpuEncodedCache::check(cudaMemcpyAsync(
+      &byte,
+      second.data[0].data(),
+      1,
+      cudaMemcpyDeviceToHost,
+      secondStream.value()));
+  secondStream.synchronize();
+  EXPECT_EQ(byte, 'x');
+  executor.drain();
 }
 
 TEST_F(GpuInputCacheTest, physicalRecoveryDoesNotCountAsGlobalArbitration) {

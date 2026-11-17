@@ -372,7 +372,8 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
       entry = it->second;
       // A reclaim already owns this allocation. Bypass until it has either
       // freed the entry or restored it after a failed completion wait.
-      if (entry->state == State::Evicting) {
+      if (entry->state == State::Evicting ||
+          (needsFill && entry->state == State::Filling)) {
         if (fill)
           ++bypasses_;
         return nullptr;

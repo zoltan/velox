@@ -178,7 +178,10 @@ class GpuEncodedCache : public std::enable_shared_from_this<GpuEncodedCache> {
       std::shared_ptr<const void> sourceIdentity = nullptr);
   /// Reserve a destination for asynchronous filling. Set needsFill only for
   /// the creator, which must call completeFill() or failFill() on its lease.
-  /// Other callers wait for allocation only; call waitForFill() before use.
+  /// Return nullptr for an existing unfinished fill so independent readers can
+  /// bypass it without sharing failures or waiting on batches not yet
+  /// submitted. Deduplicate reservations within a batch before calling this
+  /// method.
   LeasePtr reserve(
       const std::string& key,
       uint64_t bytes,

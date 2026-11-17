@@ -29,6 +29,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -255,6 +256,7 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
   std::vector<size_t> bypassIndices;
   bypass.reserve(ranges.size());
   bypassIndices.reserve(ranges.size());
+  std::unordered_map<std::string, GpuEncodedCache::LeasePtr> reservations;
   try {
     for (size_t i = 0; i < ranges.size(); ++i) {
       const auto& range = ranges[i];
@@ -276,8 +278,19 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
           (kDecoderWordBytes - range.size() % kDecoderWordBytes) %
           kDecoderWordBytes;
       bool needsFill{false};
-      owner->leases[i] = deviceCache_->reserve(
-          key, range.size() + padding, stream.get(), fileIdentity_, needsFill);
+      if (auto it = reservations.find(key); it != reservations.end()) {
+        owner->leases[i] = it->second;
+      } else {
+        owner->leases[i] = deviceCache_->reserve(
+            key,
+            range.size() + padding,
+            stream.get(),
+            fileIdentity_,
+            needsFill);
+        if (owner->leases[i]) {
+          reservations.emplace(key, owner->leases[i]);
+        }
+      }
       owner->created[i] = needsFill;
       if (auto& lease = owner->leases[i]) {
         result.data[i] = gpu::DeviceByteView{
