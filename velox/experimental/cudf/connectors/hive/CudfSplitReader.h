@@ -36,10 +36,10 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
 
-#include <optional>
 #include <cuda/memory_resource>
 
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_set>

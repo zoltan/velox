@@ -45,8 +45,7 @@ namespace cudf {
 
 __attribute__((
     error("cudf default stream argument used. Pass stream explicitly."),
-    noinline)) cuda::stream_ref const
-get_default_stream();
+    noinline)) cuda::stream_ref const get_default_stream();
 
 __attribute__((
     error("cudf default memory resource argument used. Pass mr explicitly."),
