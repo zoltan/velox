@@ -25,10 +25,13 @@
 #include <folly/Executor.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <functional>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -37,54 +40,133 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 namespace {
 
-// Owns host buffers until the uploads recorded on this stream complete. The
-// normal path retires this object on the IO executor. Executor rejection falls
-// back to draining here, preserving the same lifetime guarantee.
-class HostUploadBuffers {
+// Retains a host allocation until the copies using it complete. Error paths
+// drain synchronously; the normal path hands ownership to UploadRetirement.
+class HostUpload {
  public:
-  explicit HostUploadBuffers(cuda::stream_ref stream) : stream_(stream) {
+  HostUpload(
+      std::unique_ptr<cudf::io::datasource::buffer> buffer,
+      cuda::stream_ref stream)
+      : buffer_(std::move(buffer)), stream_(stream) {
     ensureCudaContextForThread();
     CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming));
   }
 
-  ~HostUploadBuffers() noexcept {
+  ~HostUpload() noexcept {
     try {
       ensureCudaContextForThread();
-      const auto status = recorded_ ? cudaEventSynchronize(event_)
+      const auto status = complete_ ? cudaSuccess
+          : recorded_               ? cudaEventSynchronize(event_)
                                     : cudaStreamSynchronize(stream_.get());
       if (status != cudaSuccess) {
-        // A failed context cannot establish safe DMA completion. Retain the
-        // buffers rather than freeing memory that the device may still use.
-        LOG(ERROR) << "Cannot retire cached input uploads: "
+        LOG(ERROR) << "Cannot retire input upload: "
                    << cudaGetErrorString(status);
-        retainBuffers();
+        // A failed context cannot establish safe DMA completion.
+        buffer_.release();
       }
     } catch (...) {
-      retainBuffers();
+      buffer_.release();
     }
     cudaEventDestroy(event_);
   }
 
+  const cudf::io::datasource::buffer& buffer() const {
+    return *buffer_;
+  }
+
   void recordCompletion() {
-    ensureCudaContextForThread();
     CUDF_CUDA_TRY(cudaEventRecord(event_, stream_.get()));
     recorded_ = true;
   }
 
-  std::vector<std::shared_ptr<std::unique_ptr<cudf::io::datasource::buffer>>>
-      buffers;
-
- private:
-  void retainBuffers() noexcept {
-    for (auto& buffer : buffers) {
-      buffer->release();
-    }
+  bool ready() {
+    const auto status = cudaEventQuery(event_);
+    complete_ = status == cudaSuccess;
+    // Let the destructor handle context failures without polling forever.
+    return status != cudaErrorNotReady;
   }
 
+ private:
+  std::unique_ptr<cudf::io::datasource::buffer> buffer_;
   cuda::stream_ref stream_;
   cudaEvent_t event_{};
   bool recorded_{false};
+  bool complete_{false};
 };
+
+// Polls completions independently of the IO executor. Scan every outstanding
+// event so a stalled stream cannot delay releasing buffers from other streams.
+// Buffer destructors may call CUDA (e.g. cudaFreeHost), excluding host
+// callbacks.
+class UploadRetirement {
+ public:
+  UploadRetirement() : worker_([this] { run(); }) {}
+
+  ~UploadRetirement() {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+    }
+    changed_.notify_one();
+    worker_.join();
+  }
+
+  void add(std::unique_ptr<HostUpload> upload) {
+    {
+      std::lock_guard lock(mutex_);
+      uploads_.push_back(std::move(upload));
+    }
+    changed_.notify_one();
+  }
+
+ private:
+  void run() noexcept {
+    std::list<std::unique_ptr<HostUpload>> pending;
+    for (;;) {
+      {
+        std::unique_lock lock(mutex_);
+        if (pending.empty()) {
+          changed_.wait(lock, [&] { return stopping_ || !uploads_.empty(); });
+        } else {
+          changed_.wait_for(lock, std::chrono::milliseconds(1), [&] {
+            return stopping_ || !uploads_.empty();
+          });
+        }
+        pending.splice(pending.end(), uploads_);
+        if (stopping_) {
+          break;
+        }
+      }
+      // Both CUDA calls and arbitrary buffer destructors stay outside the lock.
+      try {
+        ensureCudaContextForThread();
+        for (auto it = pending.begin(); it != pending.end();) {
+          if ((*it)->ready()) {
+            it = pending.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      } catch (...) {
+        // Each owner conservatively drains or retains its allocation on error.
+        pending.clear();
+      }
+    }
+    // Process shutdown drains accepted uploads before destroying the service.
+  }
+
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::list<std::unique_ptr<HostUpload>> uploads_;
+  bool stopping_{false};
+  std::thread worker_;
+};
+
+void retireUpload(std::unique_ptr<HostUpload> upload) {
+  upload->recordCompletion();
+  static UploadRetirement retirement;
+  retirement.add(std::move(upload));
+}
 
 // Launches the `read` task on the IO executor or waiting thread, whichever
 // starts first.
@@ -175,16 +257,18 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
   return submitDeviceRead(
       input_->executor(), [this, offset, size, dst, stream]() {
-        auto hostBuffer = host_read(offset, size);
-        ensureCudaContextForThread();
+        auto upload =
+            std::make_unique<HostUpload>(host_read(offset, size), stream);
+        const auto bytes = upload->buffer().size();
         CUDF_CUDA_TRY(cudaMemcpyAsync(
             dst,
-            hostBuffer->data(),
-            hostBuffer->size(),
+            upload->buffer().data(),
+            bytes,
             cudaMemcpyDefault,
             stream.get()));
-        recordBytes("cudfInputH2DBytes", hostBuffer->size());
-        return hostBuffer->size();
+        retireUpload(std::move(upload));
+        recordBytes("cudfInputH2DBytes", bytes);
+        return bytes;
       });
 }
 
@@ -227,8 +311,6 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
     std::vector<bool> created;
     std::vector<std::future<size_t>> pending;
     std::vector<size_t> expected;
-    std::shared_ptr<HostUploadBuffers> uploads;
-    folly::Executor* executor;
     cuda::stream_ref stream;
     explicit Owner(cuda::stream_ref value) : stream(value) {}
     gpu::DeviceReadBatch bypass;
@@ -259,23 +341,6 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
           error = std::current_exception();
         }
       }
-      if (uploads) {
-        try {
-          uploads->recordCompletion();
-        } catch (...) {
-          if (!error) {
-            error = std::current_exception();
-          }
-        }
-        try {
-          // No driver-side device wait. A rejected submission destroys the
-          // capture here and drains safely before propagating read failures.
-          executor->add([retirement = std::move(uploads)] {});
-        } catch (...) {
-          // Cleanup was synchronous; executor shutdown does not invalidate an
-          // otherwise completed read.
-        }
-      }
       if (error) {
         for (size_t i = 0; i < leases.size(); ++i) {
           if (created[i]) {
@@ -303,7 +368,6 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
   };
   auto owner = std::make_shared<Owner>(stream);
   owner->source = shared_from_this();
-  owner->executor = input_->executor();
   owner->leases.resize(ranges.size());
   owner->created.resize(ranges.size());
   owner->pending.reserve(ranges.size());
@@ -404,12 +468,6 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
       }
       std::vector<GpuEncodedCache::LeasePtr> fillLeases(
           owner->leases.begin() + i, owner->leases.begin() + end);
-      auto retainedBuffer = std::make_shared<std::unique_ptr<buffer>>();
-      if (!owner->uploads) {
-        owner->uploads = std::make_shared<HostUploadBuffers>(stream);
-        owner->uploads->buffers.reserve(ranges.size());
-      }
-      owner->uploads->buffers.push_back(retainedBuffer);
       owner->expected.push_back(bytes);
       owner->pending.push_back(submitDeviceRead(
           input_->executor(),
@@ -418,23 +476,23 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
            bytes,
            destinations = std::move(destinations),
            stream,
-           retainedBuffer,
            fillLeases = std::move(fillLeases)] {
             try {
-              auto& buffer = *retainedBuffer;
-              buffer = source->host_read(offset, bytes);
-              VELOX_CHECK_EQ(buffer->size(), bytes, "Short cached input read");
-              ensureCudaContextForThread();
+              auto upload = std::make_unique<HostUpload>(
+                  source->host_read(offset, bytes), stream);
+              VELOX_CHECK_EQ(
+                  upload->buffer().size(), bytes, "Short cached input read");
               size_t consumed{0};
               for (const auto& [destination, length] : destinations) {
                 CUDF_CUDA_TRY(cudaMemcpyAsync(
                     destination,
-                    buffer->data() + consumed,
+                    upload->buffer().data() + consumed,
                     length,
                     cudaMemcpyDefault,
                     stream.get()));
                 consumed += length;
               }
+              retireUpload(std::move(upload));
               source->recordBytes("cudfInputH2DBytes", bytes);
               // Publish on the producer, even if its consumer has not waited
               // yet. Other queries sharing a fill must not depend on that

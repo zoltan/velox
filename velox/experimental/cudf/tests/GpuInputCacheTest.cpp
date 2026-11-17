@@ -562,16 +562,16 @@ TEST_F(GpuInputCacheTest, coldReadsReturnPendingAndCoalesceMisses) {
   executor.drain();
 }
 
-TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
+void testUploadRetirement(bool cacheEnabled) {
   class PinnedBuffer final : public cudf::io::datasource::buffer {
    public:
-    explicit PinnedBuffer(std::atomic<bool>& freed) : freed_(freed) {
+    explicit PinnedBuffer(std::promise<void>& freed) : freed_(freed) {
       GpuEncodedCache::check(cudaMallocHost(&data_, 8));
       std::memset(data_, 'x', 8);
     }
     ~PinnedBuffer() override {
       cudaFreeHost(data_);
-      freed_.store(true);
+      freed_.set_value();
     }
     const uint8_t* data() const override {
       return data_;
@@ -582,18 +582,18 @@ TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
 
    private:
     uint8_t* data_;
-    std::atomic<bool>& freed_;
+    std::promise<void>& freed_;
   };
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
   auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  setEncodedInputGpuCache(cacheEnabled ? cache : nullptr);
   SCOPE_EXIT {
     setEncodedInputGpuCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
-  folly::CPUThreadPoolExecutor executor(2);
+  folly::CPUThreadPoolExecutor executor(1);
   auto input = std::make_shared<CacheableInput>(
       std::make_shared<InMemoryReadFile>(std::string(8, 'x')),
       *pool,
@@ -601,7 +601,8 @@ TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
       &executor);
   auto source = std::make_shared<RecordingInputSource>(
       input, nullptr, std::make_shared<StringIdLease>(ids, "pinned-async"));
-  std::atomic<bool> freed{false};
+  std::promise<void> freed;
+  auto freedFuture = freed.get_future();
   source->suppliedBuffer = std::make_unique<PinnedBuffer>(freed);
   rmm::cuda_stream stream;
   rmm::device_async_resource_ref mr{upstream};
@@ -618,17 +619,35 @@ TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
   auto batch = source->readDeviceRangesAsync(ranges, false, stream, mr, mr);
   auto completion = std::async(std::launch::async, [&] { batch.wait(); });
   const auto status = completion.wait_for(std::chrono::seconds(2));
-  EXPECT_FALSE(freed.load());
+  EXPECT_EQ(
+      freedFuture.wait_for(std::chrono::seconds(0)),
+      std::future_status::timeout);
+  // A blocked GPU must not occupy the only thread serving physical reads.
+  std::promise<void> ioProgress;
+  auto ioFuture = ioProgress.get_future();
+  executor.add([&] { ioProgress.set_value(); });
+  const auto ioStatus = ioFuture.wait_for(std::chrono::seconds(2));
   unblock.set_value();
   completion.get();
   EXPECT_EQ(status, std::future_status::ready);
   executor.join();
-  EXPECT_TRUE(freed.load());
+  EXPECT_EQ(ioStatus, std::future_status::ready);
+  EXPECT_EQ(
+      freedFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  freedFuture.get();
   uint8_t value = 0;
   GpuEncodedCache::check(cudaMemcpyAsync(
       &value, batch.data[0].data(), 1, cudaMemcpyDeviceToHost, stream.value()));
   stream.synchronize();
   EXPECT_EQ(value, 'x');
+}
+
+TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
+  testUploadRetirement(true);
+}
+
+TEST_F(GpuInputCacheTest, uncachedUploadsDoNotBlockIoExecutor) {
+  testUploadRetirement(false);
 }
 
 TEST_F(GpuInputCacheTest, coalescedMissesHaveBoundedHostReads) {
