@@ -197,7 +197,11 @@ class SharedResultSink final : public Operator {
     return core::PlanNode::Boundary::kInput;
   }
   void close() override {
-    finishProducer();
+    if (buffer_ && !noMoreInput_ && !buffer_->allReadersClosed()) {
+      buffer_->cancel();
+    } else {
+      finishProducer();
+    }
     buffer_.reset();
     Operator::close();
   }

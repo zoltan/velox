@@ -1447,6 +1447,45 @@ TEST_F(CteTest, spillingJoinProducerFeedsSpillingSelfJoin) {
   }
 }
 
+TEST_F(CteTest, prematureProducerCloseCancelsReaders) {
+  auto type = ROW({"c0"}, {BIGINT()});
+  PlanBuilder query;
+  query.with("t", [&](PlanBuilder& cte) { cte.tableScan(type); });
+  auto plan = query.fromCte("t").build();
+  CursorParameters params;
+  params.planNode = plan;
+  params.maxDrivers = 1;
+  params.queryCtx =
+      core::QueryCtx::Builder().executor(driverExecutor_.get()).build();
+  auto cursor = TaskCursor::create(params);
+  auto task = cursor->task();
+  SCOPE_EXIT {
+    auto cancelled = task->requestCancel();
+    Task::resume(task);
+    cancelled.wait();
+    waitForTaskDriversToFinish(task.get());
+  };
+  cursor->start();
+  ASSERT_TRUE(waitUntil([&] { return task->testingHasDriverWaitForSplit(); }));
+  task->requestPause().wait();
+  Operator* sink = nullptr;
+  task->testingVisitDrivers([&](Driver* driver) {
+    for (auto* op : driver->operators()) {
+      if (op->operatorType() == "SharedResultSink") {
+        sink = op;
+      }
+    }
+  });
+  ASSERT_NE(sink, nullptr);
+  auto buffer = std::dynamic_pointer_cast<detail::SharedResultBuffer>(
+      task->getCustomJoinBridge(kUngroupedGroupId, plan->id()));
+  ASSERT_NE(buffer, nullptr);
+  sink->close();
+  ContinueFuture observer = ContinueFuture::makeEmpty();
+  VELOX_ASSERT_THROW(
+      buffer->readerBlocked(0, &observer), "Shared result cancelled");
+}
+
 TEST_F(CteTest, taskCancellationWakesCteWaiters) {
   auto input =
       makeRowVector({makeFlatVector<int64_t>(128, [](auto i) { return i; })});
