@@ -569,6 +569,20 @@ void GpuEncodedCache::release(
       eligible_ += entry->bytes;
     }
   }
+  if (admissionDisabled_.load()) {
+    // An aborted pool will not be selected for later reclamation. Drain entries
+    // as their last consumers release them instead of retaining their storage
+    // until process shutdown.
+    try {
+      evict(0);
+    } catch (const std::exception& error) {
+      // evict() restores allocations whose completion cannot be established.
+      // Keep them protected for later cleanup; this lease destructor is
+      // noexcept.
+      LOG(ERROR) << "Failed to release aborted GPU cache storage: "
+                 << error.what();
+    }
+  }
 }
 
 } // namespace facebook::velox::cudf_velox

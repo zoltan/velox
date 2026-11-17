@@ -113,7 +113,6 @@ TEST_F(GpuInputCacheTest, abortedCacheReleasesIdleAndBypassesAdmission) {
   stream.synchronize();
   EXPECT_EQ(value, 0x2a);
   pinned.reset();
-  cache->evict(0);
   EXPECT_EQ(cache->pool()->usedBytes(), 0);
 }
 
