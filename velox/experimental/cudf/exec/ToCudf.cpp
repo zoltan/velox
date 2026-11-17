@@ -98,6 +98,7 @@ bool CompileState::compile(bool allowCpuFallback) {
   struct OperatorProperties : OperatorAdapter::Properties {
     const OperatorAdapter* adapter = nullptr;
     core::PlanNodePtr planNode;
+    bool forwardsSharedInput{false};
   };
 
   auto getOperatorProperties =
@@ -136,14 +137,35 @@ bool CompileState::compile(bool allowCpuFallback) {
       opProps.begin(),
       getOperatorProperties);
 
-  // SharedResult only forwards its query input. Its subtree also contains CTE
-  // producers, whose types and eligibility do not determine this edge's format.
-  for (size_t i = 1; i < operators.size(); ++i) {
-    if (operators[i]->operatorType() == "SharedResult") {
+  // A CTE producer publishes in its input domain. Scans normalize for their
+  // own consumers at runtime, avoiding cross-pipeline planning dependencies.
+  // Pick the first non-transparent consumer; a terminal reader returns host
+  // vectors. This also handles nested SharedResult pass-through operators.
+  for (size_t i = 0; i < operators.size(); ++i) {
+    if (operators[i]->operatorType() == "SharedScan") {
+      size_t consumer = i + 1;
+      while (consumer < operators.size() &&
+             (operators[consumer]->operatorType() == "SharedResult" ||
+              operators[consumer]->operatorType() == "SharedResultSink")) {
+        ++consumer;
+      }
+      opProps[i].forwardsSharedInput = consumer == operators.size() &&
+          operators.back()->operatorType() == "SharedResultSink";
+      const bool gpu = consumer < operators.size() &&
+          opProps[consumer].acceptsGpuInput &&
+          isTypeSupportedByCudf(opProps[i].planNode->outputType());
+      opProps[i].canRunOnGPU = true;
+      opProps[i].acceptsGpuInput = false;
+      opProps[i].producesGpuOutput = gpu;
+    } else if (
+        i > 0 &&
+        (operators[i]->operatorType() == "SharedResult" ||
+         operators[i]->operatorType() == "SharedResultSink")) {
       const bool gpu = opProps[i - 1].producesGpuOutput;
       opProps[i].canRunOnGPU = gpu;
       opProps[i].acceptsGpuInput = gpu;
-      opProps[i].producesGpuOutput = gpu;
+      opProps[i].producesGpuOutput =
+          gpu && operators[i]->operatorType() != "SharedResultSink";
     }
   }
 
@@ -256,6 +278,21 @@ bool CompileState::compile(bool allowCpuFallback) {
       } else {
         // CPU operator without adapter
         isPureCpuOperator = true;
+      }
+    }
+
+    if (oper->operatorType() == "SharedScan" &&
+        !thisOpProps.forwardsSharedInput) {
+      if (thisOpProps.producesGpuOutput) {
+        auto conversion = std::make_unique<CudfFromVelox>(
+            id, planNode->outputType(), ctx, planNode->id() + "-from-velox");
+        conversion->allowMatchingInput();
+        replaceOp.push_back(std::move(conversion));
+      } else {
+        auto conversion = std::make_unique<CudfToVelox>(
+            id, planNode->outputType(), ctx, planNode->id() + "-to-velox");
+        conversion->allowMatchingInput();
+        replaceOp.push_back(std::move(conversion));
       }
     }
 

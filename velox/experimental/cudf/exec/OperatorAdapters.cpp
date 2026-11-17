@@ -1018,9 +1018,7 @@ class LocalExchangeAdapter : public OperatorAdapter {
   }
 };
 
-// Keeps the shared-result scheduler. Matching producer/scan eligibility forces
-// one representation at the CTE boundary, including CPU producers converted
-// once before publication. Unsupported schemas keep the existing CPU path.
+// Keeps the shared-result scheduler; CompileState resolves edge domains.
 class SharedResultAdapter final : public OperatorAdapter {
  public:
   explicit SharedResultAdapter(std::string name)
@@ -1031,25 +1029,10 @@ class SharedResultAdapter final : public OperatorAdapter {
   }
 
   bool canRunOnGPU(
-      const exec::Operator* op,
-      const core::PlanNodePtr& planNode,
-      exec::DriverCtx* ctx) const override {
-    core::PlanNodePtr source;
-    if (auto scan =
-            std::dynamic_pointer_cast<const exec::detail::SharedScanNode>(
-                planNode)) {
-      const auto* binding = core::PlanNode::findFirstNode(
-          ctx->task->planFragment().planNode.get(),
-          [&](const auto* node) { return node->id() == scan->sharedId(); });
-      VELOX_CHECK_NOT_NULL(binding);
-      source = binding->sources().at(1);
-    } else if (
-        auto binding =
-            std::dynamic_pointer_cast<const exec::detail::SharedResultNode>(
-                planNode)) {
-      source = binding->sources().at(name() == "SharedResultSink" ? 1 : 0);
-    }
-    return source && !subtreeHasUnsupportedType(source);
+      const exec::Operator*,
+      const core::PlanNodePtr&,
+      exec::DriverCtx*) const override {
+    return true;
   }
 
   bool acceptsGpuInput() const override {

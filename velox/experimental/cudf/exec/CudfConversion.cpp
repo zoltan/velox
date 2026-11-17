@@ -100,6 +100,12 @@ CudfFromVelox::CudfFromVelox(
 }
 
 void CudfFromVelox::doAddInput(RowVectorPtr input) {
+  if (allowMatchingInput_ && dynamic_cast<const CudfVector*>(input.get())) {
+    VELOX_CHECK(needsInput());
+    addRuntimeStat("matchingInputRows", RuntimeCounter(input->size()));
+    matchingInput_ = std::move(input);
+    return;
+  }
   // compile() places CudfFromVelox only after operators classified as
   // producing CPU output, so device-resident input means the upstream operator
   // is misclassified.
@@ -124,13 +130,17 @@ void CudfFromVelox::doAddInput(RowVectorPtr input) {
 }
 
 RowVectorPtr CudfFromVelox::doGetOutput() {
+  if (matchingInput_) {
+    return std::exchange(matchingInput_, nullptr);
+  }
   const auto targetOutputSize =
       preferredGpuBatchSizeRows(operatorCtx_->driverCtx()->queryConfig());
 
   finished_ = noMoreInput_ && inputs_.empty();
 
   if (finished_ or
-      (currentOutputSize_ < targetOutputSize and not noMoreInput_) or
+      (currentOutputSize_ < targetOutputSize and not noMoreInput_ and
+       !allowMatchingInput_) or
       inputs_.empty()) {
     return nullptr;
   }
@@ -202,6 +212,7 @@ void CudfFromVelox::doClose() {
   cudf::get_default_stream(cudf::allow_default_stream).sync();
   Operator::close();
   inputs_.clear();
+  matchingInput_.reset();
 }
 
 CudfToVelox::CudfToVelox(
@@ -236,6 +247,12 @@ bool CudfToVelox::isPassthroughMode() const {
 }
 
 void CudfToVelox::doAddInput(RowVectorPtr input) {
+  if (allowMatchingInput_ && !dynamic_cast<const CudfVector*>(input.get())) {
+    VELOX_CHECK(needsInput());
+    addRuntimeStat("matchingInputRows", RuntimeCounter(input->size()));
+    matchingInput_ = std::move(input);
+    return;
+  }
   // Accumulate inputs
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
@@ -292,6 +309,9 @@ RowVectorPtr CudfToVelox::convertFrontToVelox() {
 // In both cases exactly one toVeloxColumn + stream.sync() is issued
 // per output batch, regardless of how many GPU inputs were consumed.
 RowVectorPtr CudfToVelox::doGetOutput() {
+  if (matchingInput_) {
+    return std::exchange(matchingInput_, nullptr);
+  }
   if (finished_) {
     return nullptr;
   }
@@ -396,6 +416,7 @@ RowVectorPtr CudfToVelox::doGetOutput() {
 void CudfToVelox::doClose() {
   Operator::close();
   inputs_.clear();
+  matchingInput_.reset();
   veloxBuffer_.reset();
 }
 

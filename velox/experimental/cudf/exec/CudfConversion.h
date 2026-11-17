@@ -40,8 +40,16 @@ class CudfFromVelox : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::string planNodeId);
 
+  /// Allows CTE scans to forward batches already in the required domain.
+  /// Call before supplying input. Ordinary conversion edges stay strict.
+  void allowMatchingInput() {
+    allowMatchingInput_ = true;
+  }
+
   bool needsInput() const override {
-    return !finished_;
+    return !finished_ &&
+        (!allowMatchingInput_ ||
+         (!noMoreInput_ && !matchingInput_ && inputs_.empty()));
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -61,6 +69,9 @@ class CudfFromVelox : public CudfOperatorBase {
   const std::optional<std::string> timestampTimeZone_;
   std::vector<RowVectorPtr> inputs_;
   std::size_t currentOutputSize_ = 0;
+  // CTE producers retain their input domain; each reader normalizes locally.
+  bool allowMatchingInput_{false};
+  RowVectorPtr matchingInput_;
   bool finished_ = false;
 };
 
@@ -75,8 +86,17 @@ class CudfToVelox : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::string planNodeId);
 
+  /// Allows CTE scans to forward batches already in the required domain.
+  /// Call before supplying input. Ordinary conversion edges stay strict.
+  void allowMatchingInput() {
+    allowMatchingInput_ = true;
+  }
+
   bool needsInput() const override {
-    return !finished_;
+    return !finished_ &&
+        (!allowMatchingInput_ ||
+         (!noMoreInput_ && !matchingInput_ && inputs_.empty() &&
+          !veloxBuffer_));
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -103,6 +123,9 @@ class CudfToVelox : public CudfOperatorBase {
   RowVectorPtr veloxBuffer_;
   // Current offset into veloxBuffer_ for the next slice.
   vector_size_t veloxOffset_{0};
+  // CTE producers retain their input domain; each reader normalizes locally.
+  bool allowMatchingInput_{false};
+  RowVectorPtr matchingInput_;
   bool finished_ = false;
 };
 

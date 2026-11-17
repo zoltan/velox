@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -229,6 +230,69 @@ TEST_F(CudfCteTest, rootPassThroughFollowsCpuInput) {
   const auto& root = stats.at(plan->id());
   EXPECT_EQ(root.operatorStats.count("CudfFromVelox"), 0);
   EXPECT_EQ(root.operatorStats.count("CudfToVelox"), 0);
+}
+
+TEST_F(CudfCteTest, matchingDomainConversionIsZeroCopy) {
+  auto host = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto plan = PlanBuilder().values({host}).planNode();
+  auto task = Task::create(
+      "matching-cte",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver =
+      Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+  cuda::stream stream{cuda::device_ref{0}};
+  auto table = with_arrow::toCudfTable(host, pool(), stream, get_output_mr());
+  auto original = std::make_shared<CudfVector>(
+      pool(), host->type(), host->size(), std::move(table), stream);
+  for (const bool gpu : {false, true}) {
+    RowVectorPtr input = gpu
+        ? std::static_pointer_cast<RowVector>(original->shareForRead(pool()))
+        : host;
+    const auto bytes = cudfAllocatedBytes();
+    std::unique_ptr<Operator> conversion;
+    if (gpu) {
+      auto op = std::make_unique<CudfFromVelox>(
+          0, asRowType(host->type()), driver->driverCtx(), "matching");
+      op->allowMatchingInput();
+      conversion = std::move(op);
+    } else {
+      auto op = std::make_unique<CudfToVelox>(
+          0, asRowType(host->type()), driver->driverCtx(), "matching");
+      op->allowMatchingInput();
+      conversion = std::move(op);
+    }
+    conversion->initialize();
+    conversion->addInput(input);
+    EXPECT_FALSE(conversion->needsInput());
+    EXPECT_EQ(conversion->getOutput().get(), input.get());
+    EXPECT_EQ(cudfAllocatedBytes(), bytes);
+    conversion->noMoreInput();
+    EXPECT_EQ(conversion->getOutput(), nullptr);
+    EXPECT_TRUE(conversion->isFinished());
+    conversion->close();
+  }
+}
+
+TEST_F(CudfCteTest, cpuProducerWithCpuReadersStaysOnHost) {
+  registerFunction<CpuOnlyCteIdentity, int64_t, int64_t>({"cte_cpu_only"});
+  auto data = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  PlanBuilder query(pool());
+  query.with("shared", [&](auto& producer) {
+    producer.values({data}).project({"cte_cpu_only(c0) AS c0"});
+  });
+  auto plan =
+      query.fromCte("shared").project({"cte_cpu_only(c0) AS c0"}).build();
+  auto task = AssertQueryBuilder(plan)
+                  .config(CudfConfig::kCudfAllowCpuFallback, true)
+                  .assertResults(data);
+  for (const auto& pipeline : task->taskStats().pipelineStats) {
+    for (const auto& op : pipeline.operatorStats) {
+      EXPECT_NE(op.operatorType, "CudfFromVelox");
+    }
+  }
 }
 
 TEST_F(CudfCteTest, zeroCopyBuffer) {
@@ -491,9 +555,18 @@ TEST_F(CudfCteTest, sharedRevenueAndSerializedPlan) {
     }
     int uploads = 0;
     int downloads = 0;
-    for (const auto& [id, stats] : toPlanStats(task->taskStats())) {
-      uploads += stats.operatorStats.count("CudfFromVelox");
-      downloads += stats.operatorStats.count("CudfToVelox");
+    for (const auto& pipeline : task->taskStats().pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        const auto matching = op.runtimeStats.find("matchingInputRows");
+        const auto forwarded =
+            matching == op.runtimeStats.end() ? 0 : matching->second.sum;
+        // A reader's domain adapter forwards an already matching batch.
+        // Count only edges that actually transfer input between host/device.
+        if (op.inputPositions > forwarded) {
+          uploads += op.operatorType == "CudfFromVelox";
+          downloads += op.operatorType == "CudfToVelox";
+        }
+      }
     }
     EXPECT_EQ(uploads, 1);
     EXPECT_EQ(downloads, 1);
