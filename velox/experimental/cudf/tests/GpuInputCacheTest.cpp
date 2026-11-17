@@ -22,6 +22,7 @@
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/File.h"
 #include "velox/common/memory/SharedArbitrator.h"
+#include "velox/common/memory/tests/SharedArbitratorTestUtil.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/MemoryReclaimer.h"
@@ -664,6 +665,32 @@ TEST_F(GpuInputCacheTest, sharedAsyncFillDoesNotWaitForFirstConsumer) {
   waiter.get();
   EXPECT_EQ(first.data[0].data(), second.data[0].data());
   EXPECT_EQ(source->reads.size(), 1);
+}
+
+TEST_F(GpuInputCacheTest, physicalRecoveryDoesNotCountAsGlobalArbitration) {
+  auto resource = createCudfCustomMemoryResource(128L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  rmm::cuda_stream stream;
+  cache
+      ->getOrFill(
+          "idle",
+          8L << 20,
+          stream.value(),
+          [&](void* data) {
+            GpuEncodedCache::check(
+                cudaMemsetAsync(data, 0, 8L << 20, stream.value()));
+          })
+      .reset();
+  auto* arbitrator =
+      static_cast<memory::SharedArbitrator*>(resource->arbitrator());
+  memory::test::SharedArbitratorTestHelper helper(arbitrator);
+  const auto before = helper.globalArbitrationRuns();
+  EXPECT_GE(arbitrator->reclaimDiscardableMemory(8L << 20), 8L << 20);
+  EXPECT_EQ(helper.globalArbitrationRuns(), before);
+  const auto recovery = arbitrator->discardableRecoveryStats();
+  EXPECT_EQ(recovery.requests, 1);
+  EXPECT_GE(recovery.capacityBytes, 8L << 20);
 }
 
 TEST_F(GpuInputCacheTest, cachedReadKeepsPaddingOutsideLogicalView) {

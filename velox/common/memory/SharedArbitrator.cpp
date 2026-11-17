@@ -1199,8 +1199,18 @@ uint64_t SharedArbitrator::reclaimDiscardableMemory(
         candidate.participant->pool()->reclaimableBytes().value_or(0) > 0)
       *moreReclaimable = true;
   }
-  updateGlobalArbitrationStats(watch.elapsed().count(), reclaimed);
+  ++discardableRecoveryRequests_;
+  discardableRecoveryTimeNs_ += watch.elapsed().count();
+  discardableRecoveryBytes_ += reclaimed;
   return reclaimed;
+}
+
+SharedArbitrator::DiscardableRecoveryStats
+SharedArbitrator::discardableRecoveryStats() const {
+  return {
+      discardableRecoveryRequests_.load(),
+      discardableRecoveryTimeNs_.load(),
+      discardableRecoveryBytes_.load()};
 }
 
 bool SharedArbitrator::canAdmitDiscardable() const {

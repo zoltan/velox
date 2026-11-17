@@ -300,6 +300,16 @@ class SharedArbitrator : public memory::MemoryArbitrator {
       uint64_t targetBytes,
       bool* moreReclaimable = nullptr);
 
+  /// Counts explicit allocator recovery separately from global arbitration.
+  struct DiscardableRecoveryStats {
+    uint64_t requests;
+    uint64_t timeNs;
+    uint64_t capacityBytes;
+  };
+
+  /// Return cumulative recovery request counts, time, and returned capacity.
+  DiscardableRecoveryStats discardableRecoveryStats() const;
+
   /// Return whether the discardable-first policy is enabled.
   bool discardableReclaimEnabled() const {
     return boundedDiscardableReclaim_;
@@ -742,6 +752,11 @@ class SharedArbitrator : public memory::MemoryArbitrator {
   tsan_atomic<uint64_t> globalArbitrationRuns_{0};
   tsan_atomic<uint64_t> globalArbitrationTimeNs_{0};
   tsan_atomic<uint64_t> globalArbitrationBytes_{0};
+
+  // Explicit physical-allocation recovery does not run the global controller.
+  std::atomic<uint64_t> discardableRecoveryRequests_{0};
+  std::atomic<uint64_t> discardableRecoveryTimeNs_{0};
+  std::atomic<uint64_t> discardableRecoveryBytes_{0};
 
   std::atomic_uint64_t numRequests_{0};
   std::atomic_uint32_t numRunning_{0};
