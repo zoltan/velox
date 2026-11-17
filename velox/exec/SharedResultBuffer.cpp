@@ -164,13 +164,11 @@ VectorPtr shareVector(
 SharedResultBuffer::SharedResultBuffer(
     std::vector<core::PlanNodeId> readers,
     CteOptions options)
-    : options_(options) {
+    : options_(options), readers_(readers.size()) {
   VELOX_CHECK_GT(readers.size(), 0);
   VELOX_CHECK(!options.maxRetainedBytes || *options.maxRetainedBytes > 0);
-  readers_.reserve(readers.size());
   for (const auto& id : readers) {
-    VELOX_CHECK(readerIndices_.emplace(id, readers_.size()).second);
-    readers_.emplace_back();
+    VELOX_CHECK(readerIndices_.emplace(id, readerIndices_.size()).second);
   }
 }
 
@@ -191,6 +189,7 @@ void SharedResultBuffer::setReaderDriverCount(uint32_t reader, uint32_t count) {
   auto& state = readers_.at(reader);
   VELOX_CHECK(state.numDrivers == 0 || count == state.numDrivers);
   state.numDrivers = count;
+  state.configured.store(true, std::memory_order_release);
 }
 
 uint64_t SharedResultBuffer::batchMetadataBytes(const RowVector& batch) {
@@ -253,8 +252,7 @@ bool SharedResultBuffer::allReadersClosedLocked() const {
 }
 
 bool SharedResultBuffer::allReadersClosed() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return allReadersClosedLocked();
+  return allClosed_.load(std::memory_order_acquire);
 }
 
 void SharedResultBuffer::add(
@@ -281,7 +279,7 @@ void SharedResultBuffer::add(
     VELOX_CHECK(!cancelled_, "Shared result cancelled");
     VELOX_CHECK_GT(numProducers_, 0);
     VELOX_CHECK(!finishedLocked());
-    if (allReadersClosedLocked()) {
+    if (allClosed_.load(std::memory_order_relaxed)) {
       return;
     }
     if (options_.maxRetainedBytes) {
@@ -295,6 +293,7 @@ void SharedResultBuffer::add(
     // Keep entry outside the lock scope so an allocation failure during
     // insertion cannot destroy its payload while holding the mutex.
     batches_.push_back(std::move(entry));
+    published_.store(endLocked(), std::memory_order_release);
     bytes_ += bytes;
     peakBytes_ = std::max(peakBytes_, bytes_);
     // One new batch per logical reader: wake one waiting driver in each group.
@@ -315,6 +314,7 @@ uint64_t SharedResultBuffer::finish() {
     VELOX_CHECK_LT(finishedProducers_, numProducers_);
     ++finishedProducers_;
     if (finishedLocked()) {
+      finished_.store(true, std::memory_order_release);
       peakBytes = peakBytes_;
       for (auto& reader : readers_) {
         takeWaitersLocked(reader.promises, ready, true);
@@ -328,6 +328,19 @@ uint64_t SharedResultBuffer::finish() {
 bool SharedResultBuffer::readerBlocked(
     uint32_t reader,
     ContinueFuture* future) {
+  VELOX_CHECK(
+      !cancelledSnapshot_.load(std::memory_order_acquire),
+      "Shared result cancelled");
+  const auto& snapshot = readers_.at(reader);
+  VELOX_CHECK(snapshot.configured.load(std::memory_order_acquire));
+  if (snapshot.closedSnapshot.load(std::memory_order_acquire) ||
+      snapshot.nextSnapshot.load(std::memory_order_acquire) <
+          published_.load(std::memory_order_acquire) ||
+      finished_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  // Recheck after locking: publication between the fast check and waiter
+  // registration must not strand a reader without a notification.
   std::lock_guard<std::mutex> lock(mutex_);
   VELOX_CHECK(!cancelled_, "Shared result cancelled");
   auto& state = readers_.at(reader);
@@ -372,6 +385,7 @@ RowVectorPtr SharedResultBuffer::next(
     // Claim before unlocking. The local pointer pins the snapshot until the
     // consumer obtains its own references, even if the queue releases it.
     ++state.next;
+    state.nextSnapshot.store(state.next, std::memory_order_release);
     releaseLocked(released);
   }
   // Only metadata is constructed; payload buffers remain shared. Downstream
@@ -380,10 +394,15 @@ RowVectorPtr SharedResultBuffer::next(
 }
 
 bool SharedResultBuffer::atEnd(uint32_t reader) {
-  std::lock_guard<std::mutex> lock(mutex_);
   const auto& state = readers_.at(reader);
-  VELOX_CHECK_GT(state.numDrivers, 0);
-  return state.closed() || (finishedLocked() && state.next == endLocked());
+  VELOX_CHECK(state.configured.load(std::memory_order_acquire));
+  if (state.closedSnapshot.load(std::memory_order_acquire)) {
+    return true;
+  }
+  // Acquire completion before checking the final published count.
+  return finished_.load(std::memory_order_acquire) &&
+      state.nextSnapshot.load(std::memory_order_acquire) ==
+      published_.load(std::memory_order_acquire);
 }
 
 void SharedResultBuffer::closeReader(uint32_t reader) {
@@ -395,6 +414,8 @@ void SharedResultBuffer::closeReader(uint32_t reader) {
     VELOX_CHECK_LT(state.closedDrivers, state.numDrivers);
     ++state.closedDrivers;
     if (state.closed()) {
+      state.closedSnapshot.store(true, std::memory_order_release);
+      allClosed_.store(allReadersClosedLocked(), std::memory_order_release);
       takeWaitersLocked(state.promises, ready, true);
       releaseLocked(released);
     } else if (state.next < endLocked()) {
@@ -411,6 +432,7 @@ void SharedResultBuffer::cancel() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     cancelled_ = true;
+    cancelledSnapshot_.store(true, std::memory_order_release);
     for (auto& reader : readers_) {
       takeWaitersLocked(reader.promises, ready, true);
     }

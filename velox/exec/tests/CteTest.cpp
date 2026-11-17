@@ -120,6 +120,56 @@ class CteTest : public HiveConnectorTestBase {
   }
 };
 
+TEST_F(CteTest, concurrentPolling) {
+  const int iterations = std::getenv("VELOX_CTE_POLL_ITERATIONS")
+      ? std::max(1, std::atoi(std::getenv("VELOX_CTE_POLL_ITERATIONS")))
+      : 1000;
+  for (const int drivers : {1, 8, 32, 64}) {
+    auto buffer = makeBuffer(2, {}, 1, drivers);
+    buffer->add(makeRowVector({makeFlatVector<int64_t>({1})}));
+    std::promise<void> start;
+    auto gate = start.get_future().share();
+    std::vector<std::future<int>> workers;
+    for (int driver = 0; driver < drivers; ++driver) {
+      workers.push_back(std::async(std::launch::async, [&, driver] {
+        gate.wait();
+        int errors = 0;
+        for (int i = 0; i < iterations; ++i) {
+          ContinueFuture future;
+          errors += buffer->readerBlocked(driver % 2, &future);
+          errors += buffer->atEnd(driver % 2);
+          errors += buffer->allReadersClosed();
+        }
+        return errors;
+      }));
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    start.set_value();
+    for (auto& worker : workers) {
+      EXPECT_EQ(worker.get(), 0);
+    }
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
+            .count();
+    std::cout << "CTE_POLL drivers=" << drivers << " iterations=" << iterations
+              << " seconds=" << seconds << std::endl;
+    buffer->finish();
+    for (int reader = 0; reader < 2; ++reader) {
+      EXPECT_FALSE(buffer->atEnd(reader));
+      EXPECT_NE(buffer->next(reader, pool()), nullptr);
+      EXPECT_TRUE(buffer->atEnd(reader));
+      for (int driver = 0; driver < drivers; ++driver) {
+        buffer->closeReader(reader);
+      }
+    }
+    EXPECT_TRUE(buffer->allReadersClosed());
+    buffer->cancel();
+    ContinueFuture future;
+    VELOX_ASSERT_THROW(
+        buffer->readerBlocked(0, &future), "Shared result cancelled");
+  }
+}
+
 TEST_F(CteTest, immediateReadAndCopyOnWrite) {
   auto buffer = makeBuffer(2, {1 << 20});
   auto batch = makeRowVector({makeFlatVector<int64_t>({1, 2, 3})});

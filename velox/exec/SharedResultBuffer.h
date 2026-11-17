@@ -16,6 +16,7 @@
 #pragma once
 
 #include <folly/small_vector.h>
+#include <atomic>
 #include <deque>
 #include "velox/exec/Cte.h"
 #include "velox/exec/JoinBridge.h"
@@ -62,11 +63,16 @@ class SharedResultBuffer final : public JoinBridge {
   struct Reader {
     Reader() = default;
     Reader(const Reader&) = delete;
-    Reader(Reader&&) = default;
+
     bool closed() const {
       return numDrivers != 0 && closedDrivers == numDrivers;
     }
 
+    // Polling snapshots are published under mutex_. Claiming and waiter
+    // registration still recheck the authoritative state under that mutex.
+    std::atomic<uint64_t> nextSnapshot{0};
+    std::atomic<bool> closedSnapshot{false};
+    std::atomic<bool> configured{false};
     uint64_t next{0};
     uint32_t numDrivers{0};
     uint32_t closedDrivers{0};
@@ -115,5 +121,10 @@ class SharedResultBuffer final : public JoinBridge {
   uint64_t peakBytes_{0};
   uint32_t numProducers_{0};
   uint32_t finishedProducers_{0};
+  // Monotonic polling state. No payload is accessed through these snapshots.
+  std::atomic<uint64_t> published_{0};
+  std::atomic<bool> finished_{false};
+  std::atomic<bool> allClosed_{false};
+  std::atomic<bool> cancelledSnapshot_{false};
 };
 } // namespace facebook::velox::exec::detail
