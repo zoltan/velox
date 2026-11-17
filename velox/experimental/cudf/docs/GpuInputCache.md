@@ -72,3 +72,20 @@ completion, and excludes plan loading and JSON result serialization. Results
 include column names because stripping a PartitionedOutput root can change their
 order relative to SQL output. Validate names and values against the saved output
 schema, preserving row multiplicities.
+
+## Application registration
+
+Install the CPU `AsyncDataCache` instance and call
+`registerCudfMemoryResource(deviceCapacity)` before `registerCudf()`. Registration
+then owns the GPU input cache when the backend enables discardable reclamation.
+Set `CudfConfig::kGpuInputCacheEnabled` (`cudf.gpu_input_cache_enabled`) to `false`
+for CPU-only input caching. A previously installed explicit cache takes priority.
+
+All GPU queries sharing this backend must use `attachCudfMemoryPool(queryCtx)`
+before task creation, as required by GPU memory accounting. The cache and query
+pools share the same device budget. Registration does not attach query pools.
+A backend supplied by the application must enable discardable reclamation;
+registration preserves its policy. Finish all readers and queries before
+`unregisterCudf()`, which unpublishes and releases the registration-owned cache.
+Host footer inspection may precede query resource attachment; file identity is
+retained at datasource creation and device fetching uses the later resources.

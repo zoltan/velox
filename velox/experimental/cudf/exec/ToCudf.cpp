@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -414,10 +415,13 @@ void registerCudf() {
   }
 #endif
 
+  initializeEncodedInputGpuCache(
+      CudfConfig::getInstance().gpuInputCacheEnabled);
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
+  resetEncodedInputGpuCache();
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
   // Unconditionally unregister the UCX transports, whether or not
   // CudfConfig::exchange was set when registerCudf() ran.
@@ -450,6 +454,9 @@ CudfConfig& CudfConfig::getInstance() {
 
 void CudfConfig::initialize(
     std::unordered_map<std::string, std::string>&& config) {
+  if (config.find(kGpuInputCacheEnabled) != config.end()) {
+    gpuInputCacheEnabled = folly::to<bool>(config[kGpuInputCacheEnabled]);
+  }
   if (config.find(kCudfEnabled) != config.end()) {
     enabled = folly::to<bool>(config[kCudfEnabled]);
   }

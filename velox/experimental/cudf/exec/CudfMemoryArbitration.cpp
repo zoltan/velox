@@ -133,7 +133,7 @@ std::shared_ptr<memory::CustomMemoryResource> registerCudfMemoryResource(
   // An application-provided resource is retained just as permanently. Its
   // explicit capacity takes precedence over the requested capacity.
   auto resource =
-      registered ? registered : createCudfCustomMemoryResource(capacity);
+      registered ? registered : createCudfCustomMemoryResource(capacity, true);
   if (!registered) {
     registry.insert(std::string{kCudfMemoryResourceTag}, resource);
   }

@@ -20,6 +20,12 @@ class GpuEncodedCache;
 /// Install the process cache for immutable encoded input. The caller owns it.
 /// Readers use it when CPU AsyncDataCache is also available.
 void setEncodedInputGpuCache(const std::shared_ptr<GpuEncodedCache>& cache);
+/// Install a registration-owned cache when host caching and an accounted GPU
+/// backend are available. An explicitly installed cache takes precedence.
+void initializeEncodedInputGpuCache(bool enabled);
+/// Release registration ownership and unpublish the cache during cuDF shutdown.
+/// Readers and queries must have finished before unregistering cuDF.
+void resetEncodedInputGpuCache();
 /// Return the installed cache, or nullptr if absent or no longer owned.
 std::shared_ptr<GpuEncodedCache> encodedInputGpuCache();
 } // namespace facebook::velox::cudf_velox

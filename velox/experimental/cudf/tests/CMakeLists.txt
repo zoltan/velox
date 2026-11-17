@@ -411,3 +411,9 @@ velox_add_cudf_test(
   SOURCES Main.cpp GpuEncodedCacheExceptionTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} ${CMAKE_DL_LIBS}
 )
+
+velox_add_cudf_test(
+  NAME velox_cudf_gpu_input_cache_registration_test
+  SOURCES Main.cpp GpuInputCacheRegistrationTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS}
+)
