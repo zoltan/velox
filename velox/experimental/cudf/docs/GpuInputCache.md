@@ -76,12 +76,29 @@ schema, preserving row multiplicities.
 ## Cold reads and pressure
 
 The datasource reserves all ranges before submitting reads. Adjacent cache
-misses share a host read; independent groups are submitted to the IO executor
-before returning a pending batch. The producer publishes each completed fill,
-so another consumer can wait independently. The batch retains host buffers
-until their uploads finish and drains every accepted read on failure or
-abandonment. A rejected submission discards unpublished destinations after
-accepted work completes. Successful groups remain cached for retry.
+misses share a host read up to 16 MiB; a single larger requested range remains
+indivisible. Independent groups are submitted to the IO executor before
+returning a pending batch. Same-batch duplicates share their reservation. A
+reservation still being filled by another batch is bypassed, so that producer's
+read failure cannot fail an unrelated query.
+
+Cached and uncached uploads share one completion-retirement service. Each read
+records an event immediately after its copies and transfers its host buffer to
+a dedicated polling thread. Neither the driver nor an IO worker waits for normal
+upload retirement. The poller checks all pending events, so an incomplete stream
+does not prevent observing completion on another stream. Buffer destruction runs
+outside the queue lock and outside CUDA callbacks; destructors may call CUDA.
+
+Host allocations must remain valid until copy completion whether their memory is
+pageable or pinned. This contract also supports readers that retain pinned cache
+leases; it does not require another staging copy or change the host cache. On
+exceptional handoff failure the owner drains synchronously. If CUDA cannot
+establish completion, cleanup retains the host allocation rather than freeing
+potential DMA input. Process shutdown drains pending retirement work.
+
+The batch drains every accepted read on failure or abandonment. A rejected
+submission discards unpublished destinations after accepted work completes.
+Successful groups remain cached for retry.
 
 When admission is refused, the cache may evict its own idle entries and retry
 once. Global query waiters take priority over new cache admissions. Pinned
