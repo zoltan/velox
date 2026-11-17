@@ -347,7 +347,7 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
             stream.get(),
             fileIdentity_,
             needsFill);
-        if (owner->leases[i]) {
+        if (needsFill) {
           reservations.emplace(key, owner->leases[i]);
         }
       }
