@@ -1008,6 +1008,7 @@ void SharedArbitrator::startAndWaitGlobalArbitration(ArbitrationOperation& op) {
       arbitrationWaitFuture = arbitrationWait->resumePromise.getSemiFuture();
       globalArbitrationWaiters_.emplace(
           op.participant()->id(), arbitrationWait.get());
+      numGlobalArbitrationWaiters_.store(globalArbitrationWaiters_.size());
       op.participant()->setPendingArbitrationGrowCapacity(op.requestBytes());
     }
   }
@@ -1110,7 +1111,7 @@ void SharedArbitrator::runGlobalArbitration() {
   TestValue::adjust(
       "facebook::velox::memory::SharedArbitrator::runGlobalArbitration", this);
 
-  bool usedPhysicalProgress{false};
+  bool usedStatsOnlyRound{false};
   size_t round{0};
   for (;; ++round) {
     uint64_t arbitrationTimeNs{0};
@@ -1131,9 +1132,8 @@ void SharedArbitrator::runGlobalArbitration() {
       // Repeated refills must not indefinitely postpone query reclamation.
       if (getGlobalArbitrationTarget() == 0) {
         reclaimedBytes = discardedBytes;
-      } else if (
-          madeProgress && (discardedBytes != 0 || !usedPhysicalProgress)) {
-        usedPhysicalProgress = discardedBytes == 0;
+      } else if (madeProgress && (discardedBytes != 0 || !usedStatsOnlyRound)) {
+        usedStatsOnlyRound = discardedBytes == 0;
         reclaimedBytes = discardedBytes;
       } else {
         // Check if we need to abort participant to reclaim used memory to
@@ -1167,8 +1167,8 @@ void SharedArbitrator::runGlobalArbitration() {
 }
 
 bool SharedArbitrator::canAdmitDiscardable() const {
-  std::lock_guard<std::mutex> lock(stateMutex_);
-  return !hasShutdownLocked() && globalArbitrationWaiters_.empty();
+  return state_.load() != State::kShutdown &&
+      numGlobalArbitrationWaiters_.load() == 0;
 }
 
 uint64_t SharedArbitrator::reclaimDiscardableCapacity(uint64_t targetBytes) {
@@ -1641,6 +1641,7 @@ void SharedArbitrator::resumeGlobalArbitrationWaitersLocked(
     it->second->allocatedBytes = allocatedBytes;
     resumes.push_back(std::move(it->second->resumePromise));
     it = globalArbitrationWaiters_.erase(it);
+    numGlobalArbitrationWaiters_.store(globalArbitrationWaiters_.size());
   }
 }
 
@@ -1653,6 +1654,7 @@ void SharedArbitrator::removeGlobalArbitrationWaiter(uint64_t id) {
       VELOX_CHECK_EQ(it->second->allocatedBytes, 0);
       resume = std::move(it->second->resumePromise);
       globalArbitrationWaiters_.erase(it);
+      numGlobalArbitrationWaiters_.store(globalArbitrationWaiters_.size());
     }
   }
   if (resume.valid()) {

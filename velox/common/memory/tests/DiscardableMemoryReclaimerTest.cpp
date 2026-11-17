@@ -189,6 +189,17 @@ class DiscardableMemoryReclaimerTest : public testing::Test {
   std::unique_ptr<MemoryManager> manager_;
 };
 
+TEST_F(DiscardableMemoryReclaimerTest, admissionDoesNotWaitForStateMutex) {
+  setup();
+  auto* arbitrator = dynamic_cast<SharedArbitrator*>(manager_->arbitrator());
+  auto lock = test::SharedArbitratorTestHelper(arbitrator).lockState();
+  auto check = std::async(
+      std::launch::async, [&] { return arbitrator->canAdmitDiscardable(); });
+  EXPECT_EQ(check.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+  lock.unlock();
+  EXPECT_TRUE(check.get());
+}
+
 TEST_F(DiscardableMemoryReclaimerTest, prefersCacheBeforeSpillOrAbort) {
   for (bool withoutSpill : {false, true}) {
     SCOPED_TRACE(withoutSpill);

@@ -677,7 +677,7 @@ class SharedArbitrator : public memory::MemoryArbitrator {
 
   // Mutex used to protect the arbitrator internal state.
   mutable std::mutex stateMutex_;
-  State state_{State::kRunning};
+  std::atomic<State> state_{State::kRunning};
 
   tsan_atomic<uint64_t> freeReservedCapacity_{0};
   tsan_atomic<uint64_t> freeNonReservedCapacity_{0};
@@ -722,6 +722,8 @@ class SharedArbitrator : public memory::MemoryArbitrator {
   // This ensures to satisfy the arbitration request in the order of the age of
   // arbitration participants with old participants being served first.
   std::map<uint64_t, ArbitrationWait*> globalArbitrationWaiters_;
+  // Admission hint maintained under stateMutex_ with the waiter map.
+  std::atomic<uint64_t> numGlobalArbitrationWaiters_{0};
 
   tsan_atomic<uint64_t> globalArbitrationRuns_{0};
   tsan_atomic<uint64_t> globalArbitrationTimeNs_{0};

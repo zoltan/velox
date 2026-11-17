@@ -25,6 +25,10 @@ class SharedArbitratorTestHelper {
   explicit SharedArbitratorTestHelper(SharedArbitrator* arbitrator)
       : arbitrator_(arbitrator) {}
 
+  std::unique_lock<std::mutex> lockState() {
+    return std::unique_lock<std::mutex>(arbitrator_->stateMutex_);
+  }
+
   void freeCapacity(uint64_t targetBytes) {
     arbitrator_->freeCapacity(targetBytes);
   }
