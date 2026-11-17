@@ -19,6 +19,7 @@
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
+#include "velox/exec/Cte.h"
 #include "velox/exec/PartitionFunction.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
@@ -89,6 +90,7 @@ void TpcdsBenchmark::initialize() {
   core::PlanNode::registerSerDe();
   core::ITypedExpr::registerSerDe();
   exec::registerPartitionFunctionSerDe();
+  exec::registerCteSerDe();
 
   // Presto-dumped plans use connector ID "hive", while the base class
   // registers under kHiveConnectorId ("test-hive"). Register a properly

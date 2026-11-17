@@ -17,10 +17,13 @@
 
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/vector/ComplexVector.h"
+#include "velox/vector/SharedVector.h"
 #include "velox/vector/TypeAliases.h"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/table/table.hpp>
+
+#include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
 
@@ -38,10 +41,10 @@ namespace facebook::velox::cudf_velox {
 // GPU data.
 //
 // CudfVector assumes that the input table data is already ready to consume.
-// Constructors and rebindStream() do not insert CUDA stream waits for work that
-// populated the input buffers; callers must establish that ordering before
+// Constructors and unshared rebindStream() do not insert stream waits for work
+// that populated the input buffers; callers must establish that ordering before
 // constructing or rebinding a CudfVector.
-class CudfVector : public RowVector {
+class CudfVector : public RowVector, public SharedVector {
  public:
   /// Constructs a CudfVector from an owned cudf::table.
   /// The table's buffers are freed on 'stream', or on the stream passed to a
@@ -65,6 +68,11 @@ class CudfVector : public RowVector {
       std::unique_ptr<cudf::packed_table>&& packedTable,
       cuda::stream_ref stream);
 
+  ~CudfVector() override;
+
+  /// Shares immutable device buffers with independent consumer metadata.
+  RowVectorPtr shareForRead(memory::MemoryPool* pool) override;
+
   cuda::stream_ref stream() const {
     return stream_;
   }
@@ -72,21 +80,43 @@ class CudfVector : public RowVector {
   /// Returns a view of the underlying table. Throws after release().
   cudf::table_view getTableView() const;
 
-  /// Releases ownership of the underlying table.
+  /// Releases ownership of the underlying table. Shared storage is copied on
+  /// the consumer stream so other readers retain their original buffers.
   /// If constructed from packed_table, materializes a table from the view
   /// first (which copies the data). Throws if called more than once.
   std::unique_ptr<cudf::table> release();
 
-  /// Rebinds the vector's device buffers (owned or packed) to use 'stream' for
-  /// future deallocation.
-  /// This only changes future stream/deallocation association. It does not make
-  /// 'stream' wait on the previous stream or any producer stream.
+  /// Uses 'destination' for copies required to obtain exclusive ownership.
+  /// Already exclusive table storage is transferred without allocating.
+  std::unique_ptr<cudf::table> release(
+      rmm::device_async_resource_ref destination);
+
+  /// Rebinds owned table buffers to use 'stream' for future deallocation.
+  /// Unshared storage only changes its deallocation association; the caller
+  /// establishes readiness. Shared snapshots also order this reader's previous
+  /// stream before the new stream without mutating the other readers.
   /// Returns false if the storage was already taken by release().
   bool rebindStream(cuda::stream_ref stream);
 
   uint64_t estimateFlatSize() const override;
 
  private:
+  // Owns an immutable device table and its final deallocation stream.
+  struct SharedStorage;
+
+  // Constructs a private view of an already published payload.
+  CudfVector(
+      memory::MemoryPool* pool,
+      TypePtr type,
+      vector_size_t size,
+      std::shared_ptr<SharedStorage> storage,
+      cudf::table_view view,
+      uint64_t bytes,
+      cuda::stream_ref stream);
+
+  // Joins this consumer into the shared owner before dropping its reference.
+  void releaseShared() noexcept;
+
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override;
 
   // Storage for either an owned table or packed table.
@@ -96,7 +126,10 @@ class CudfVector : public RowVector {
       std::unique_ptr<cudf::packed_table>>;
   TableStorage tableStorage_;
 
-  // Views either the owned table or the packed table. Invalid after release().
+  // Set only after publication; owned buffers then live in SharedStorage.
+  std::shared_ptr<SharedStorage> sharedStorage_;
+
+  // Views owned, packed, or shared storage. Invalid after release().
   cudf::table_view tabView_;
 
   cuda::stream_ref stream_;

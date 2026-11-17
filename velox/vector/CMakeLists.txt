@@ -48,6 +48,7 @@ velox_add_library(
   DictionaryVector.h
   EncodedVectorCopy.h
   FlatMapKeyIndex.h
+  SharedVector.h
   FlatMapVector.h
   FlatVector-inl.h
   FlatVector.h

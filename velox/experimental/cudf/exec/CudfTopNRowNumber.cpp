@@ -373,7 +373,7 @@ RowVectorPtr CudfTopNRowNumber::doGetOutput() {
 
   auto pool = candidates_->pool();
   auto const size = candidates_->size();
-  auto cols = candidates_->release()->release();
+  auto cols = candidates_->release(get_output_mr())->release();
   cols.push_back(std::move(ranks));
   auto finalTable = std::make_unique<cudf::table>(std::move(cols));
 

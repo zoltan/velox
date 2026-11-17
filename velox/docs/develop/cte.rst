@@ -327,3 +327,36 @@ claimed downstream batches. Pool metrics exclude ordinary heap metadata
 allocations. Plans saved during warmup include per-operator statistics. Driver
 counts apply per eligible pipeline, not to the task as a whole; small tables or
 few row groups may leave many drivers idle.
+
+cuDF execution
+--------------
+
+With cuDF enabled, shared CTEs whose producer subtrees have supported types use
+GPU-resident batches. The existing shared-result operators and task-local queue
+remain in place. A CPU producer is converted once before publication; unsupported
+producer types retain the CPU path. The saved-plan benchmark registers CTE
+serialization together with the ordinary plan nodes.
+
+Each reader receives independent ``CudfVector`` metadata referring to the same
+immutable device allocations. Publishing and claiming a batch do not copy its
+payload or allocate another device table. The ``SharedVector`` interface keeps
+the generic queue independent of device storage. An operator that requests an
+owned table through ``CudfVector::release()`` receives a private device copy while
+storage is shared. Zero-copy sharing does not imply that every downstream
+operator can operate without copying.
+
+A reader changing streams orders its previous stream before its next use. Its
+last stream is joined to the allocation owner's stream before its reference is
+released, so asynchronous reads finish before buffers can be reused. Streams
+must outlive the vectors using them, as for ordinary cuDF execution.
+
+Device allocations retain their original memory-resource accounting; reader
+views do not charge the payload again. The existing retained-byte guard includes
+device payload bytes. Its scope is unchanged: claimed downstream batches are
+excluded, and retained CTE state is not spillable or discardable input cache.
+
+``velox_cudf_cte_test`` checks device pointer identity and allocation counts,
+packed and nested buffers, independent consumer streams, cancellation, byte
+limits, CPU fallback, serialization, parallel producer multiplicity and shared
+aggregation/join plans. Input uploads and final result downloads remain necessary
+when the query starts and ends with CPU vectors.

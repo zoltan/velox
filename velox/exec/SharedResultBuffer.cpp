@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/SharedResultBuffer.h"
+#include "velox/vector/SharedVector.h"
 
 #include "velox/vector/ConstantVector.h"
 #include "velox/vector/DictionaryVector.h"
@@ -63,6 +64,9 @@ VectorPtr shareVector(
     bool publication) {
   if (!vector) {
     return nullptr;
+  }
+  if (auto* shared = dynamic_cast<SharedVector*>(vector.get())) {
+    return shared->shareForRead(pool);
   }
   const auto size = vector->size();
   switch (vector->encoding()) {
@@ -262,8 +266,10 @@ void SharedResultBuffer::add(
   // Resolve only logically visible rows before the producer advances. This
   // preserves dictionary/constant selections and parent ROW null masks before
   // snapshotting recursively visits the underlying vectors.
-  LazyVector::ensureLoadedRowsRecursively(
-      batch, SelectivityVector(batch->size()));
+  if (!dynamic_cast<SharedVector*>(batch.get())) {
+    LazyVector::ensureLoadedRowsRecursively(
+        batch, SelectivityVector(batch->size()));
+  }
   batch = std::static_pointer_cast<RowVector>(
       shareVector(batch, batch->pool(), true));
   const auto bytes = batchBytes(*batch);

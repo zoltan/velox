@@ -259,7 +259,7 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
-  auto inputTableColumns = cudfInput->release()->release();
+  auto inputTableColumns = cudfInput->release(get_output_mr())->release();
   auto outputSize = input_->size();
 
   if (hasFilter_) {

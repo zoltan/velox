@@ -68,7 +68,7 @@ RowVectorPtr CudfAssignUniqueId::doGetOutput() {
   auto uniqueIdColumn =
       generateIdColumn(input_->size(), stream, get_output_mr());
   auto size = cudfVector->size();
-  auto columns = cudfVector->release()->release();
+  auto columns = cudfVector->release(get_output_mr())->release();
   columns.push_back(std::move(uniqueIdColumn));
   auto output = std::make_shared<CudfVector>(
       input_->pool(),

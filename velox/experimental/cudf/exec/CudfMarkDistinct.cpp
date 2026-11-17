@@ -218,7 +218,7 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
   // Append marker column to output.
   auto pool = cudfInput->pool();
   auto size = cudfInput->size();
-  auto columns = cudfInput->release()->release();
+  auto columns = cudfInput->release(get_output_mr())->release();
   columns.push_back(std::move(markerCol));
   cudfInput.reset();
   input_ = nullptr;

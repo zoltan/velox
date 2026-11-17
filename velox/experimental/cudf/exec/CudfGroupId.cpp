@@ -110,7 +110,7 @@ void CudfGroupId::doAddInput(RowVectorPtr input) {
   inputSize_ = static_cast<cudf::size_type>(cudfInput->size());
 
   // Store input columns for cycling through grouping sets
-  auto table = cudfInput->release();
+  auto table = cudfInput->release(get_output_mr());
   inputColumns_ = table->release();
   groupingSetIndex_ = 0;
 }

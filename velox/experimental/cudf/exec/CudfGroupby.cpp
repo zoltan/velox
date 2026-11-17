@@ -2295,7 +2295,7 @@ CudfVectorPtr CudfGroupby::finalizeGroupedStates(
   auto bufferedResult = std::move(bufferedResult_);
   const auto stream = bufferedResult->stream();
   const auto numRows = bufferedResult->size();
-  auto columns = bufferedResult->release()->release();
+  auto columns = bufferedResult->release(get_output_mr())->release();
   const auto numKeys = groupingKeyOutputChannels_.size();
   VELOX_CHECK_EQ(columns.size(), numKeys + aggregators.size());
 

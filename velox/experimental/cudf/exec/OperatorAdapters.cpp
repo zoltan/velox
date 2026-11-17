@@ -52,6 +52,7 @@
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
+#include "velox/exec/CteInternal.h"
 #include "velox/exec/EnforceSingleRow.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/GroupId.h"
@@ -1017,6 +1018,58 @@ class LocalExchangeAdapter : public OperatorAdapter {
   }
 };
 
+// Keeps the shared-result scheduler. Matching producer/scan eligibility forces
+// one representation at the CTE boundary, including CPU producers converted
+// once before publication. Unsupported schemas keep the existing CPU path.
+class SharedResultAdapter final : public OperatorAdapter {
+ public:
+  explicit SharedResultAdapter(std::string name)
+      : OperatorAdapter(std::move(name)) {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->operatorType() == name();
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    core::PlanNodePtr source;
+    if (auto scan =
+            std::dynamic_pointer_cast<const exec::detail::SharedScanNode>(
+                planNode)) {
+      const auto* binding = core::PlanNode::findFirstNode(
+          ctx->task->planFragment().planNode.get(),
+          [&](const auto* node) { return node->id() == scan->sharedId(); });
+      VELOX_CHECK_NOT_NULL(binding);
+      source = binding->sources().at(1);
+    } else if (
+        auto binding =
+            std::dynamic_pointer_cast<const exec::detail::SharedResultNode>(
+                planNode)) {
+      source = binding->sources().at(name() == "SharedResultSink" ? 1 : 0);
+    }
+    return source && !subtreeHasUnsupportedType(source);
+  }
+
+  bool acceptsGpuInput() const override {
+    return name() != "SharedScan";
+  }
+  bool producesGpuOutput() const override {
+    return name() != "SharedResultSink";
+  }
+  bool keepOperator() const override {
+    return true;
+  }
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator*,
+      const core::PlanNodePtr&,
+      exec::DriverCtx*,
+      int32_t) const override {
+    return {};
+  }
+};
+
 /// AssignUniqueIdAdapter - Replaces with CudfAssignUniqueId
 class AssignUniqueIdAdapter : public OperatorAdapter {
  public:
@@ -1525,6 +1578,9 @@ void registerAllOperatorAdapters() {
 
   // Clear any existing adapters
   registry.clear();
+  for (const auto* name : {"SharedResult", "SharedResultSink", "SharedScan"}) {
+    registry.registerAdapter(std::make_unique<SharedResultAdapter>(name));
+  }
 
   // Register all adapters
   registry.registerAdapter(std::make_unique<TableScanAdapter>());

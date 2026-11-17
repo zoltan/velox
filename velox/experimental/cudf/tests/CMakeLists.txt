@@ -368,3 +368,9 @@ add_subdirectory(utils)
 if(${VELOX_ENABLE_SPARK_FUNCTIONS})
   add_subdirectory(sparksql)
 endif()
+
+velox_add_cudf_test(
+  NAME velox_cudf_cte_test
+  SOURCES Main.cpp CudfCteTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS}
+)

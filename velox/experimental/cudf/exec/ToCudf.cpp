@@ -117,8 +117,9 @@ bool CompileState::compile(bool allowCpuFallback) {
           props.acceptsGpuInput = true;
           props.producesGpuOutput = true;
         }
-        // Reject operators whose output types cannot be represented in cuDF.
-        if (props.planNode &&
+        // Input-only sinks use their adapter's input eligibility, not the
+        // associated plan node's output type (e.g. the final CTE query result).
+        if (props.producesGpuOutput && props.planNode &&
             !isTypeSupportedByCudf(props.planNode->outputType())) {
           props.canRunOnGPU = false;
           props.acceptsGpuInput = false;
