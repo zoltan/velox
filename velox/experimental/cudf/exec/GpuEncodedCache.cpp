@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/cudf/exec/GpuEncodedCache.h"
 
+#include "velox/common/memory/SharedArbitrator.h"
+
 #include <folly/ScopeGuard.h>
 
 namespace facebook::velox::cudf_velox {
@@ -65,8 +67,11 @@ uint64_t GpuEncodedCache::Reclaimer::reclaim(
 void GpuEncodedCache::Reclaimer::abort(
     memory::MemoryPool*,
     const std::exception_ptr&) {
-  if (auto cache = cache_.load().lock())
+  if (auto cache = cache_.load().lock()) {
+    cache->admissionDisabled_ = true;
     ++cache->aborts_;
+    cache->evict(0);
+  }
 }
 
 void GpuEncodedCache::Lease::prepareCompletion() {
@@ -244,6 +249,10 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
     static_cast<Reclaimer*>(root_->reclaimer())->bind(weak_from_this());
   });
   ensureCudaContextForThread();
+  auto* arbitrator =
+      dynamic_cast<memory::SharedArbitrator*>(resource_->arbitrator());
+  const bool canAdmit = !admissionDisabled_.load() &&
+      (!arbitrator || arbitrator->canAdmitDiscardable());
   Lease lease(shared_from_this(), stream);
   auto& shard = shardFor(key);
   std::shared_ptr<Entry> entry;
@@ -263,7 +272,7 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
           lockHoldNs_ += now() - acquired;
         return nullptr;
       }
-      if (now() < admitAfterNs_.load()) {
+      if (!canAdmit || now() < admitAfterNs_.load()) {
         ++bypasses_;
         if (profile_)
           lockHoldNs_ += now() - acquired;
@@ -334,8 +343,30 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
   if (creator) {
     try {
       lease.prepareCompletion();
-      entry->data = reporting_->allocate(
-          cuda::stream_ref{stream}, bytes, alignof(std::max_align_t));
+      for (unsigned attempt = 0;; ++attempt) {
+        try {
+          entry->data = reporting_->allocate(
+              cuda::stream_ref{stream}, bytes, alignof(std::max_align_t));
+          break;
+        } catch (...) {
+          const auto error = std::current_exception();
+          try {
+            std::rethrow_exception(error);
+          } catch (const std::bad_alloc&) {
+          } catch (const VeloxException& exception) {
+            if (exception.errorCode() != error_code::kMemCapExceeded &&
+                exception.errorCode() != error_code::kMemAllocError) {
+              throw;
+            }
+          }
+          // Replace only our idle payloads, at most once, and yield to queries.
+          if (attempt != 0 || admissionDisabled_.load() ||
+              (arbitrator && !arbitrator->canAdmitDiscardable()) ||
+              evict(bytes) == 0) {
+            std::rethrow_exception(error);
+          }
+        }
+      }
       check(cudaEventCreateWithFlags(&entry->ready, cudaEventDisableTiming));
       (*fill)(entry->data);
       check(cudaEventRecord(entry->ready, stream));
@@ -368,7 +399,10 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
           throw;
         } catch (const std::bad_alloc&) {
         } catch (const VeloxException& error) {
-          if (error.errorCode() != error_code::kMemCapExceeded &&
+          if (error.errorCode() == error_code::kMemAborted) {
+            admissionDisabled_ = true;
+          } else if (
+              error.errorCode() != error_code::kMemCapExceeded &&
               error.errorCode() != error_code::kMemAllocError) {
             ++fillErrors_;
             throw;

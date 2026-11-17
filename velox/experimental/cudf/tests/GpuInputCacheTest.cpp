@@ -86,6 +86,57 @@ TEST_F(GpuInputCacheTest, ShardedCachePinsAndStreamCompletion) {
   cudaStreamDestroy(producer);
 }
 
+TEST_F(GpuInputCacheTest, abortedCacheReleasesIdleAndBypassesAdmission) {
+  auto resource = createCudfCustomMemoryResource(32L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  rmm::cuda_stream stream;
+  auto fill = [&](void* data) {
+    GpuEncodedCache::check(
+        cudaMemsetAsync(data, 0x2a, 8L << 20, stream.value()));
+  };
+  auto pinned = cache->getOrFill("pinned", 8L << 20, stream.value(), fill);
+  auto idle = cache->getOrFill("idle", 8L << 20, stream.value(), fill);
+  ASSERT_TRUE(pinned);
+  ASSERT_TRUE(idle);
+  idle.reset();
+  cache->pool()->abort(
+      std::make_exception_ptr(std::runtime_error("test abort")));
+  EXPECT_EQ(cache->pool()->usedBytes(), 8L << 20);
+  EXPECT_NO_THROW(EXPECT_EQ(
+      cache->getOrFill("new", 8L << 20, stream.value(), fill), nullptr));
+  uint8_t value = 0;
+  GpuEncodedCache::check(cudaMemcpyAsync(
+      &value, pinned->data(), 1, cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  EXPECT_EQ(value, 0x2a);
+  pinned.reset();
+  cache->evict(0);
+  EXPECT_EQ(cache->pool()->usedBytes(), 0);
+}
+
+TEST_F(GpuInputCacheTest, admissionReplacesOnlyIdleEntries) {
+  auto resource = createCudfCustomMemoryResource(16L << 20, true);
+  auto upstream = createMemoryResource("cuda", 0);
+  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  rmm::cuda_stream stream;
+  auto fill = [&](void* data) {
+    GpuEncodedCache::check(
+        cudaMemsetAsync(data, 0x37, 8L << 20, stream.value()));
+  };
+  auto pinned = cache->getOrFill("pinned", 8L << 20, stream.value(), fill);
+  auto idle = cache->getOrFill("idle", 8L << 20, stream.value(), fill);
+  ASSERT_TRUE(pinned);
+  ASSERT_TRUE(idle);
+  idle.reset();
+  auto replacement =
+      cache->getOrFill("replacement", 8L << 20, stream.value(), fill);
+  EXPECT_TRUE(replacement);
+  EXPECT_EQ(cache->get("idle", stream.value()), nullptr);
+  EXPECT_TRUE(cache->get("pinned", stream.value()));
+  EXPECT_EQ(cache->pool()->usedBytes(), 16L << 20);
+}
+
 TEST_F(GpuInputCacheTest, ShardedCacheCoalescesConcurrentFill) {
   setCudfContextDevice(0);
   auto owner = createCudfCustomMemoryResource(128L << 20, true);
@@ -363,7 +414,7 @@ TEST_F(GpuInputCacheTest, ShardedAdmissionBypassesWithoutSpilling) {
   query.deallocate_sync(data, 56L << 20, alignof(std::max_align_t));
 }
 
-TEST_F(GpuInputCacheTest, ShardedAdmissionAtParticipantLimitBypasses) {
+TEST_F(GpuInputCacheTest, pinnedAdmissionAtParticipantLimitBypasses) {
   setCudfContextDevice(0);
   auto owner = createCudfCustomMemoryResource(64L << 20, true);
   auto cache =
@@ -372,8 +423,7 @@ TEST_F(GpuInputCacheTest, ShardedAdmissionAtParticipantLimitBypasses) {
     GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 56L << 20));
   });
   ASSERT_TRUE(first);
-  first
-      .reset(); // Even evictable entries must not be reclaimed to admit a fill.
+  // Keep the old entry pinned: replacement may reclaim only idle entries.
   GpuEncodedCache::LeasePtr next;
   EXPECT_NO_THROW(
       next = cache->getOrFill(
@@ -393,6 +443,7 @@ TEST_F(GpuInputCacheTest, ShardedAdmissionAtParticipantLimitBypasses) {
       cudaMemcpy(&value, retained->data(), 1, cudaMemcpyDeviceToHost));
   EXPECT_EQ(value, 0x5a);
   retained.reset();
+  first.reset();
   EXPECT_EQ(cache->evict(0), 56L << 20);
   EXPECT_EQ(cache->pool()->usedBytes(), 0);
 }

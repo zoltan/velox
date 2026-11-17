@@ -208,6 +208,8 @@ class GpuEncodedCache : public std::enable_shared_from_this<GpuEncodedCache> {
   std::mutex freeMutex_;
   std::once_flag bindOnce_;
   bool profile_;
+  // Stop admitting new allocations after the cache pool is aborted.
+  std::atomic<bool> admissionDisabled_{false};
   std::atomic<uint64_t> admitAfterNs_{0}, admitted_{0}, admissionFailures_{0},
       fillErrors_{0};
   std::atomic<uint64_t> cursor_{0}, eligible_{0}, pendingFree_{0}, hits_{0},
