@@ -232,10 +232,12 @@ class ArbitrationParticipant
 
   /// Invoked to reclaim used memory from this memory pool with specified
   /// 'targetBytes'. The function returns the actually freed capacity.
+  /// Set applyReclaimFloor to false for bounded discardable storage requests.
   uint64_t reclaim(
       uint64_t targetBytes,
       uint64_t maxWaitTimeNs,
-      MemoryReclaimer::Stats& stats) noexcept;
+      MemoryReclaimer::Stats& stats,
+      bool applyReclaimFloor = true) noexcept;
 
   /// Invoked to abort the query memory pool and returns the reclaimed bytes
   /// after abort.

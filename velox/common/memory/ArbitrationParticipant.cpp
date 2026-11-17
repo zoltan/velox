@@ -272,11 +272,14 @@ int64_t ArbitrationParticipant::globalArbitrationGrowCapacity() const {
 uint64_t ArbitrationParticipant::reclaim(
     uint64_t targetBytes,
     uint64_t maxWaitTimeNs,
-    MemoryReclaimer::Stats& stats) noexcept {
+    MemoryReclaimer::Stats& stats,
+    bool applyReclaimFloor) noexcept {
   const auto minReclaimBytes = std::max(
       config_->minReclaimBytes,
       static_cast<uint64_t>(capacity() * config_->minReclaimPct));
-  targetBytes = std::max(targetBytes, minReclaimBytes);
+  if (applyReclaimFloor) {
+    targetBytes = std::max(targetBytes, minReclaimBytes);
+  }
   if (targetBytes == 0) {
     return 0;
   }

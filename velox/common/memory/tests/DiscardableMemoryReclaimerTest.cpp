@@ -133,7 +133,10 @@ class DiscardableMemoryReclaimerTest : public testing::Test {
     SharedArbitrator::unregisterFactory();
   }
 
-  void setup(std::optional<bool> enabled = true, bool withoutSpill = false) {
+  void setup(
+      std::optional<bool> enabled = true,
+      bool withoutSpill = false,
+      bool defaultReclaim = false) {
     MemoryManager::Options options;
     options.allocatorCapacity = kCapacity;
     options.arbitratorKind = "SHARED";
@@ -154,6 +157,10 @@ class DiscardableMemoryReclaimerTest : public testing::Test {
       options.extraArbitratorConfigs[std::string(
           SharedArbitrator::ExtraConfig::kBoundedDiscardableReclaim)] =
           enabled.value() ? "true" : "false";
+    }
+    if (defaultReclaim) {
+      options.extraArbitratorConfigs.erase("memory-pool-min-reclaim-bytes");
+      options.extraArbitratorConfigs.erase("memory-pool-min-reclaim-pct");
     }
     manager_ = std::make_unique<MemoryManager>(options);
   }
@@ -284,6 +291,77 @@ TEST_F(DiscardableMemoryReclaimerTest, concurrentCapacityReturnIsProgress) {
       .waitForGlobalArbitrationToFinish();
   EXPECT_EQ(query->state->calls, 0);
   EXPECT_EQ(query->state->aborts, 0);
+}
+
+TEST_F(DiscardableMemoryReclaimerTest, abortPreservesDiscardablePool) {
+  setup();
+  auto cache = participant("cache", true);
+  auto query = participant("query", false);
+  cache->state->allocate(192 * kMegabyte);
+  cache->state->pinned = true;
+  query->state->allocate(64 * kMegabyte);
+  manager_->arbitrator()->shrinkCapacity(kBlock, false, true);
+  EXPECT_FALSE(cache->root->aborted());
+  EXPECT_EQ(cache->state->aborts, 0);
+  EXPECT_TRUE(query->root->aborted());
+}
+
+TEST_F(DiscardableMemoryReclaimerTest, onlyDiscardablePoolIsNotAbortVictim) {
+  setup();
+  auto cache = participant("cache", true);
+  cache->state->allocate(64 * kMegabyte);
+  cache->state->pinned = true;
+  EXPECT_EQ(manager_->arbitrator()->shrinkCapacity(kBlock, false, true), 0);
+  EXPECT_FALSE(cache->root->aborted());
+}
+
+TEST_F(DiscardableMemoryReclaimerTest, externalShrinkDiscardsBeforeSpilling) {
+  setup();
+  auto cache = participant("cache", true);
+  auto query = participant("query", false);
+  cache->state->allocate(64 * kMegabyte);
+  query->state->allocate(192 * kMegabyte);
+  EXPECT_GE(
+      manager_->arbitrator()->shrinkCapacity(kBlock, false, false), kBlock);
+  EXPECT_GT(cache->state->calls, 0);
+  EXPECT_EQ(query->state->calls, 0);
+}
+
+TEST_F(DiscardableMemoryReclaimerTest, defaultFloorsDoNotExpandDiscardTarget) {
+  setup(true, false, true);
+  auto cache = participant("cache", true);
+  auto query = participant("query", false);
+  auto requester = participant("requester", false);
+  cache->state->allocate(192 * kMegabyte);
+  query->state->allocate(64 * kMegabyte);
+  requester->state->allocate(kBlock);
+  test::SharedArbitratorTestHelper(
+      static_cast<SharedArbitrator*>(manager_->arbitrator()))
+      .waitForGlobalArbitrationToFinish();
+  EXPECT_LE(cache->state->lastTarget, kBlock + 16 * kMegabyte);
+  EXPECT_GE(cache->root->usedBytes(), 172 * kMegabyte);
+}
+
+TEST_F(DiscardableMemoryReclaimerTest, refillProgressCannotStarveQuery) {
+  setup();
+  auto cache = participant("cache", true);
+  auto query = participant("query", false);
+  auto requester = participant("requester", false);
+  cache->state->allocate(64 * kMegabyte);
+  query->state->allocate(192 * kMegabyte);
+  cache->state->afterReclaim = [&] {
+    // Model admission consuming the freed reservation before shrink can return
+    // it. Bound the reproduction so the broken implementation also finishes.
+    if (cache->state->calls < 8) {
+      cache->state->allocate(64 * kMegabyte - cache->root->usedBytes());
+    }
+  };
+  requester->state->allocate(kBlock);
+  test::SharedArbitratorTestHelper(
+      static_cast<SharedArbitrator*>(manager_->arbitrator()))
+      .waitForGlobalArbitrationToFinish();
+  EXPECT_LE(cache->state->calls, 2);
+  EXPECT_GT(query->state->calls, 0);
 }
 
 TEST_F(DiscardableMemoryReclaimerTest, disabledPolicyRetainsStockSelection) {

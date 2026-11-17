@@ -57,6 +57,8 @@ class SharedArbitrator : public memory::MemoryArbitrator {
     /// Defaults to false.
     static constexpr std::string_view kBoundedDiscardableReclaim{
         "bounded-discardable-reclaim"};
+    static bool boundedDiscardableReclaim(
+        const std::unordered_map<std::string, std::string>& configs);
 
     /// The memory capacity reserved to ensure each running query has minimal
     /// capacity of 'memoryPoolReservedCapacity' to run.
@@ -289,6 +291,11 @@ class SharedArbitrator : public memory::MemoryArbitrator {
       bool allowSpill = true,
       bool force = false) override final;
 
+  /// Return whether opportunistic cache admission may use spare capacity.
+  /// Cache implementations also consult this before using retained
+  /// reservations.
+  bool canAdmitDiscardable() const;
+
   Stats stats() const final;
 
   std::string kind() const override;
@@ -437,6 +444,9 @@ class SharedArbitrator : public memory::MemoryArbitrator {
   // Sets 'madeProgress' if reclamation or satisfied demand warrants another
   // cache-first round, including capacity returned by a concurrent allocator.
   uint64_t reclaimDiscardableMemory(bool& madeProgress);
+
+  // Reclaims a bounded amount of clean storage for external capacity requests.
+  uint64_t reclaimDiscardableCapacity(uint64_t targetBytes);
 
   // Invoked to run global arbitration to reclaim free or used memory from other
   // queries. The global arbitration run is protected by the exclusive lock of

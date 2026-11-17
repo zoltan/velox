@@ -109,6 +109,11 @@ double SharedArbitrator::ExtraConfig::memoryPoolMinFreeCapacityPct(
       kDefaultMemoryPoolMinFreeCapacityPct);
 }
 
+bool SharedArbitrator::ExtraConfig::boundedDiscardableReclaim(
+    const std::unordered_map<std::string, std::string>& configs) {
+  return getConfig<bool>(configs, kBoundedDiscardableReclaim, false);
+}
+
 uint64_t SharedArbitrator::ExtraConfig::memoryPoolMinReclaimBytes(
     const std::unordered_map<std::string, std::string>& configs) {
   return config::toCapacity(
@@ -225,10 +230,7 @@ SharedArbitrator::SharedArbitrator(const Config& config)
       memoryReclaimThreadsHwMultiplier_(
           ExtraConfig::memoryReclaimThreadsHwMultiplier(config.extraConfigs)),
       boundedDiscardableReclaim_(
-          getConfig<bool>(
-              config.extraConfigs,
-              ExtraConfig::kBoundedDiscardableReclaim,
-              false)),
+          ExtraConfig::boundedDiscardableReclaim(config.extraConfigs)),
       globalArbitrationEnabled_(
           ExtraConfig::globalArbitrationEnabled(config.extraConfigs)),
       globalArbitrationMemoryReclaimPct_(
@@ -647,6 +649,11 @@ SharedArbitrator::sortAndGroupAbortCandidates(
 std::optional<ArbitrationCandidate> SharedArbitrator::findAbortCandidate(
     bool force) {
   auto candidates = getCandidates();
+  std::erase_if(candidates, [](const auto& candidate) {
+    return candidate.participant->aborted() ||
+        dynamic_cast<DiscardableMemoryReclaimer*>(
+            candidate.participant->pool()->reclaimer()) != nullptr;
+  });
 
   // Account in attempting global arbitration capacity for fair selection, to
   // avoid unfairness caused by small participant requesting large grow.
@@ -788,12 +795,20 @@ uint64_t SharedArbitrator::shrinkCapacity(
   checkRunning();
 
   const uint64_t targetBytes = requestBytes == 0 ? capacity_ : requestBytes;
-  ScopedMemoryArbitrationContext abitrationCtx{};
+  const bool nestedReclaim = underMemoryArbitration();
+  ScopedMemoryArbitrationContext arbitrationCtx;
   const folly::stop_watch<std::chrono::nanoseconds> reclaimWatch;
 
-  uint64_t totalReclaimedCapacity{0};
-  if (allowSpill) {
-    totalReclaimedCapacity += reclaimUsedMemoryBySpill(targetBytes);
+  uint64_t totalReclaimedCapacity =
+      boundedDiscardableReclaim_ ? reclaimUnusedCapacity() : 0;
+  if (boundedDiscardableReclaim_ && !nestedReclaim &&
+      totalReclaimedCapacity < targetBytes) {
+    totalReclaimedCapacity +=
+        reclaimDiscardableCapacity(targetBytes - totalReclaimedCapacity);
+  }
+  if (allowSpill && totalReclaimedCapacity < targetBytes) {
+    totalReclaimedCapacity +=
+        reclaimUsedMemoryBySpill(targetBytes - totalReclaimedCapacity);
   }
 
   totalReclaimedCapacity += reclaimUnusedCapacity();
@@ -855,13 +870,18 @@ void SharedArbitrator::growCapacity(ArbitrationOperation& op) {
   checkIfAborted(op);
   checkIfTimeout(op);
 
+  const bool discardable = boundedDiscardableReclaim_ &&
+      dynamic_cast<DiscardableMemoryReclaimer*>(
+          op.participant()->pool()->reclaimer()) != nullptr;
+  if (discardable && !canAdmitDiscardable()) {
+    VELOX_MEM_POOL_CAP_EXCEEDED(
+        "Queries are waiting; refuse disposable cache admission");
+  }
   if (maybeGrowFromSelf(op)) {
     return;
   }
 
-  if (boundedDiscardableReclaim_ &&
-      dynamic_cast<DiscardableMemoryReclaimer*>(
-          op.participant()->pool()->reclaimer()) != nullptr) {
+  if (discardable) {
     // Cache admission uses idle capacity without reclaiming live state.
     // Check the growth precondition before constructing arbitration targets.
     if (!op.participant()->checkCapacityGrowth(op.requestBytes())) {
@@ -1090,6 +1110,7 @@ void SharedArbitrator::runGlobalArbitration() {
   TestValue::adjust(
       "facebook::velox::memory::SharedArbitrator::runGlobalArbitration", this);
 
+  bool usedPhysicalProgress{false};
   size_t round{0};
   for (;; ++round) {
     uint64_t arbitrationTimeNs{0};
@@ -1106,7 +1127,13 @@ void SharedArbitrator::runGlobalArbitration() {
       const auto discardedBytes = boundedDiscardableReclaim_
           ? reclaimDiscardableMemory(madeProgress)
           : 0;
-      if (madeProgress) {
+      // One statistics-only round accommodates concurrent capacity return.
+      // Repeated refills must not indefinitely postpone query reclamation.
+      if (getGlobalArbitrationTarget() == 0) {
+        reclaimedBytes = discardedBytes;
+      } else if (
+          madeProgress && (discardedBytes != 0 || !usedPhysicalProgress)) {
+        usedPhysicalProgress = discardedBytes == 0;
         reclaimedBytes = discardedBytes;
       } else {
         // Check if we need to abort participant to reclaim used memory to
@@ -1139,6 +1166,31 @@ void SharedArbitrator::runGlobalArbitration() {
                       << " with " << round << " rounds";
 }
 
+bool SharedArbitrator::canAdmitDiscardable() const {
+  std::lock_guard<std::mutex> lock(stateMutex_);
+  return !hasShutdownLocked() && globalArbitrationWaiters_.empty();
+}
+
+uint64_t SharedArbitrator::reclaimDiscardableCapacity(uint64_t targetBytes) {
+  uint64_t reclaimed{0};
+  for (const auto& candidate : getCandidates()) {
+    if (reclaimed >= targetBytes) {
+      break;
+    }
+    if (candidate.reclaimableUsedCapacity == 0 ||
+        dynamic_cast<DiscardableMemoryReclaimer*>(
+            candidate.participant->pool()->reclaimer()) == nullptr) {
+      continue;
+    }
+    reclaimed += reclaim(
+        candidate.participant,
+        targetBytes - reclaimed,
+        maxArbitrationTimeNs_,
+        false);
+  }
+  return reclaimed;
+}
+
 uint64_t SharedArbitrator::reclaimDiscardableMemory(bool& madeProgress) {
   madeProgress = false;
   uint64_t reclaimed{0};
@@ -1162,7 +1214,6 @@ uint64_t SharedArbitrator::reclaimDiscardableMemory(bool& madeProgress) {
           : 0;
     }
     if (demand == 0) {
-      madeProgress = true;
       break;
     }
     // Amortize small growth bursts without the global percentage-based floor.
@@ -1468,7 +1519,11 @@ uint64_t SharedArbitrator::reclaim(
   MemoryReclaimer::Stats stats;
   {
     NanosecondWallTimer reclaimTimer(&reclaimTimeNs);
-    reclaimedBytes = participant->reclaim(targetBytes, timeoutNs, stats);
+    const bool discardable = boundedDiscardableReclaim_ &&
+        dynamic_cast<DiscardableMemoryReclaimer*>(
+            participant->pool()->reclaimer()) != nullptr;
+    reclaimedBytes =
+        participant->reclaim(targetBytes, timeoutNs, stats, !discardable);
   }
   if (madeProgress != nullptr) {
     // A concurrent allocator can shrink the freed reservation before this
