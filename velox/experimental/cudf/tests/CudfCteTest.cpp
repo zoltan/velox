@@ -27,6 +27,7 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/functions/Udf.h"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/null_mask.hpp>
@@ -46,6 +47,15 @@ using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::cudf_velox;
+
+namespace {
+template <typename T>
+struct CpuOnlyCteIdentity {
+  void call(int64_t& output, const int64_t& input) {
+    output = input;
+  }
+};
+} // namespace
 
 class CudfCteTest : public OperatorTestBase {
  protected:
@@ -201,6 +211,24 @@ TEST_F(CudfCteTest, readerReleaseDoesNotBlockProducerStream) {
   EXPECT_EQ(status, std::future_status::ready);
   cudaEventDestroy(marker);
   consumer.sync();
+}
+
+TEST_F(CudfCteTest, rootPassThroughFollowsCpuInput) {
+  registerFunction<CpuOnlyCteIdentity, int64_t, int64_t>({"cte_cpu_only"});
+  auto data = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  PlanBuilder query(pool());
+  query.with("shared", [&](auto& producer) {
+    producer.values({data}).project({"c0"});
+  });
+  auto plan =
+      query.fromCte("shared").project({"cte_cpu_only(c0) AS c0"}).build();
+  auto task = AssertQueryBuilder(plan)
+                  .config(CudfConfig::kCudfAllowCpuFallback, true)
+                  .assertResults(data);
+  const auto stats = toPlanStats(task->taskStats());
+  const auto& root = stats.at(plan->id());
+  EXPECT_EQ(root.operatorStats.count("CudfFromVelox"), 0);
+  EXPECT_EQ(root.operatorStats.count("CudfToVelox"), 0);
 }
 
 TEST_F(CudfCteTest, zeroCopyBuffer) {

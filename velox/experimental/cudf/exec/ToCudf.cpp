@@ -136,6 +136,17 @@ bool CompileState::compile(bool allowCpuFallback) {
       opProps.begin(),
       getOperatorProperties);
 
+  // SharedResult only forwards its query input. Its subtree also contains CTE
+  // producers, whose types and eligibility do not determine this edge's format.
+  for (size_t i = 1; i < operators.size(); ++i) {
+    if (operators[i]->operatorType() == "SharedResult") {
+      const bool gpu = opProps[i - 1].producesGpuOutput;
+      opProps[i].canRunOnGPU = gpu;
+      opProps[i].acceptsGpuInput = gpu;
+      opProps[i].producesGpuOutput = gpu;
+    }
+  }
+
   int32_t operatorsOffset = 0;
   // When an operator's input types are unsupported by cuDF, all subsequent
   // operators in the pipeline must also stay on CPU.
