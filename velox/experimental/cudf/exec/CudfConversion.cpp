@@ -130,17 +130,17 @@ void CudfFromVelox::doAddInput(RowVectorPtr input) {
 }
 
 RowVectorPtr CudfFromVelox::doGetOutput() {
-  if (matchingInput_) {
+  if (matchingInput_ && inputs_.empty()) {
     return std::exchange(matchingInput_, nullptr);
   }
   const auto targetOutputSize =
       preferredGpuBatchSizeRows(operatorCtx_->driverCtx()->queryConfig());
 
-  finished_ = noMoreInput_ && inputs_.empty();
+  finished_ = noMoreInput_ && inputs_.empty() && !matchingInput_;
 
   if (finished_ or
       (currentOutputSize_ < targetOutputSize and not noMoreInput_ and
-       !allowMatchingInput_) or
+       !matchingInput_) or
       inputs_.empty()) {
     return nullptr;
   }
@@ -309,7 +309,7 @@ RowVectorPtr CudfToVelox::convertFrontToVelox() {
 // In both cases exactly one toVeloxColumn + stream.sync() is issued
 // per output batch, regardless of how many GPU inputs were consumed.
 RowVectorPtr CudfToVelox::doGetOutput() {
-  if (matchingInput_) {
+  if (matchingInput_ && inputs_.empty() && !veloxBuffer_) {
     return std::exchange(matchingInput_, nullptr);
   }
   if (finished_) {
@@ -325,7 +325,7 @@ RowVectorPtr CudfToVelox::doGetOutput() {
       totalSize += inputs_.front()->size();
       inputs_.pop_front();
     }
-    finished_ = noMoreInput_ && inputs_.empty();
+    finished_ = noMoreInput_ && inputs_.empty() && !matchingInput_;
     if (totalSize == 0) {
       return nullptr;
     }
@@ -345,7 +345,7 @@ RowVectorPtr CudfToVelox::doGetOutput() {
     // correct (e.g. default pipeline without explicit batch-size overrides).
     if (isPassthroughMode()) {
       auto output = convertFrontToVelox();
-      finished_ = noMoreInput_ && inputs_.empty();
+      finished_ = noMoreInput_ && inputs_.empty() && !matchingInput_;
       if (output->size() == 0) {
         return nullptr;
       }
@@ -391,7 +391,7 @@ RowVectorPtr CudfToVelox::doGetOutput() {
   const auto totalRows = static_cast<vector_size_t>(veloxBuffer_->size());
   if (veloxOffset_ >= totalRows) {
     veloxBuffer_.reset();
-    finished_ = noMoreInput_ && inputs_.empty();
+    finished_ = noMoreInput_ && inputs_.empty() && !matchingInput_;
     return nullptr;
   }
 
@@ -407,7 +407,7 @@ RowVectorPtr CudfToVelox::doGetOutput() {
 
   if (veloxOffset_ >= totalRows) {
     veloxBuffer_.reset();
-    finished_ = noMoreInput_ && inputs_.empty();
+    finished_ = noMoreInput_ && inputs_.empty() && !matchingInput_;
   }
 
   return slice;

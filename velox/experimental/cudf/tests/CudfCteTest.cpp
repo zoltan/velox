@@ -352,6 +352,59 @@ TEST_F(CudfCteTest, matchingDomainConversionIsZeroCopy) {
   }
 }
 
+TEST_F(CudfCteTest, matchingDomainPreservesBatching) {
+  auto host = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto plan = PlanBuilder().values({host}).planNode();
+  auto task = Task::create(
+      "batching-cte",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver =
+      Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+  cuda::stream stream{cuda::device_ref{0}};
+  auto table = with_arrow::toCudfTable(host, pool(), stream, get_output_mr());
+  auto device = std::make_shared<CudfVector>(
+      pool(), host->type(), host->size(), std::move(table), stream);
+  CudfFromVelox upload(
+      0, asRowType(host->type()), driver->driverCtx(), "batching");
+  upload.allowMatchingInput();
+  upload.initialize();
+  upload.addInput(host);
+  EXPECT_EQ(upload.getOutput(), nullptr);
+  // Matching input flushes accumulated host rows before forwarding itself.
+  auto shared =
+      std::static_pointer_cast<RowVector>(device->shareForRead(pool()));
+  upload.addInput(shared);
+  auto converted = upload.getOutput();
+  ASSERT_NE(converted, nullptr);
+  EXPECT_NE(converted.get(), shared.get());
+  EXPECT_EQ(converted->size(), host->size());
+  upload.noMoreInput();
+  EXPECT_FALSE(upload.isFinished());
+  EXPECT_EQ(upload.getOutput().get(), shared.get());
+  EXPECT_EQ(upload.getOutput(), nullptr);
+  EXPECT_TRUE(upload.isFinished());
+  upload.close();
+
+  CudfToVelox download(
+      1, asRowType(host->type()), driver->driverCtx(), "batching");
+  download.allowMatchingInput();
+  download.initialize();
+  download.addInput(shared);
+  download.addInput(host);
+  download.noMoreInput();
+  auto output = download.getOutput();
+  ASSERT_NE(output, nullptr);
+  facebook::velox::test::assertEqualVectors(host, output);
+  EXPECT_FALSE(download.isFinished());
+  EXPECT_EQ(download.getOutput().get(), host.get());
+  EXPECT_EQ(download.getOutput(), nullptr);
+  EXPECT_TRUE(download.isFinished());
+  download.close();
+}
+
 TEST_F(CudfCteTest, cpuProducerWithCpuReadersStaysOnHost) {
   registerFunction<CpuOnlyCteIdentity, int64_t, int64_t>({"cte_cpu_only"});
   auto data = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
