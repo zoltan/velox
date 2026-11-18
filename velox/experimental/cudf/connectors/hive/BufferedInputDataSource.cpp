@@ -558,6 +558,10 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
 
     // Coalesce adjacent misses into host reads, then scatter directly into the
     // retained destinations. Submit every group before waiting for completion.
+    // Match cuDF 26.12 @ c9086e0a: parquet_io_utils.cpp's device_read_mutex
+    // serializes submission batches across callers, not physical completion.
+    // This gate covers this cached implementation's callers; cuDF's fallback
+    // owns its separate gate. INTERLEAVE (the default) takes neither gate.
     static std::mutex submissionMutex;
     std::unique_lock submissionLock(submissionMutex, std::defer_lock);
     if (serializeSubmissions) {
