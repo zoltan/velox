@@ -27,6 +27,7 @@ This guide is intended for Velox contributors and developers of Velox-based appl
     develop/task
     develop/task-barrier
     develop/simd
+    develop/device-input-ownership
     develop/gpu-acceleration
     develop/memory
     develop/spilling
