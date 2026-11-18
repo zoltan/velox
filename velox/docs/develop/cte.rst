@@ -385,7 +385,8 @@ Buffering projected device inputs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A shared-column projection retains its parent batch while it streams. Before
-join build, right-semi probe, or sort buffers a projection across batches,
+join build, right-semi probe, sort, final/single distinct, non-incremental
+group-by, or reduction buffers a projection across batches,
 ``CudfVector::forBuffering`` detaches its visible columns if it retains omitted
 ancestor columns. Complete shared batches, reordered complete projections, and
 exclusive inputs remain zero-copy. This is an ownership rule, independent of
@@ -401,3 +402,10 @@ it excludes hash-table construction. It asserts return to the allocation
 baseline after close. A separate test covers nulls, ancestor retention, and
 pointer-preserving whole-batch buffering. If another reader still needs the
 wide parent, compaction can temporarily add a narrow allocation alongside it.
+
+The reduction variant verifies the exact INT64 sum after buffering the same
+sixteen projected batches. Retained bytes fell from 170,393,600 to 17,039,360;
+peak bytes fell from 170,393,600 to 27,688,960. Two warmed repeats averaged
+18.36 ms before and 19.13 ms after. This boundary includes upload, projection,
+buffering and per-batch synchronization, but excludes the final reduction.
+The test also verifies that tracked allocations return to baseline on close.

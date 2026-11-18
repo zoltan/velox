@@ -965,7 +965,8 @@ void CudfReduce::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
-  inputs_.push_back(std::move(cudfInput));
+  inputs_.push_back(
+      CudfVector::forBuffering(std::move(cudfInput), get_output_mr()));
 }
 
 CudfVectorPtr CudfReduce::doGlobalAggregation(

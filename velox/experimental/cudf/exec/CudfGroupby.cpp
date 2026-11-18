@@ -2226,7 +2226,8 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
   }
 
   // Handle non-streaming cases.
-  inputs_.push_back(std::move(cudfInput));
+  inputs_.push_back(
+      CudfVector::forBuffering(std::move(cudfInput), get_output_mr()));
 }
 
 CudfVectorPtr CudfGroupby::doGroupByAggregation(

@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/exec/CudfGroupId.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
+#include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -85,6 +86,8 @@ class CudfCteTest : public OperatorTestBase {
     CudfConfig::getInstance().memoryResource = savedResource_;
     OperatorTestBase::TearDown();
   }
+  void testNarrowSharedProjection(bool reduce);
+
   bool savedFallback_;
   std::string savedResource_;
 };
@@ -164,6 +167,14 @@ TEST_F(CudfCteTest, sharedProjectionDoesNotCopyUnusedColumns) {
 }
 
 TEST_F(CudfCteTest, narrowSharedProjectionDoesNotRetainWideJoinBuildInput) {
+  testNarrowSharedProjection(false);
+}
+
+TEST_F(CudfCteTest, narrowSharedProjectionDoesNotRetainWideReduceInput) {
+  testNarrowSharedProjection(true);
+}
+
+void CudfCteTest::testNarrowSharedProjection(bool reduce) {
   constexpr vector_size_t kRows = 1 << 16;
   constexpr int kBatches = 16;
   std::vector<VectorPtr> columns;
@@ -176,10 +187,13 @@ TEST_F(CudfCteTest, narrowSharedProjectionDoesNotRetainWideJoinBuildInput) {
   auto projected =
       PlanBuilder(ids).values({host}).project({"c0", "c1"}).planNode();
   auto probe = makeRowVector({"p"}, {columns[0]});
-  auto plan = PlanBuilder(ids)
-                  .values({probe})
-                  .hashJoin({"p"}, {"c0"}, projected, "", {"p"})
-                  .planNode();
+  auto plan = reduce ? PlanBuilder(projected, ids)
+                           .singleAggregation({}, {"sum(c0) as total"})
+                           .planNode()
+                     : PlanBuilder(ids)
+                           .values({probe})
+                           .hashJoin({"p"}, {"c0"}, projected, "", {"p"})
+                           .planNode();
   auto task = Task::create(
       "retained-projection",
       core::PlanFragment{plan},
@@ -193,12 +207,20 @@ TEST_F(CudfCteTest, narrowSharedProjectionDoesNotRetainWideJoinBuildInput) {
       driver->driverCtx(),
       nullptr,
       std::dynamic_pointer_cast<const core::ProjectNode>(projected));
-  CudfHashJoinBuild build(
-      1,
-      driver->driverCtx(),
-      std::dynamic_pointer_cast<const core::HashJoinNode>(plan));
+  std::unique_ptr<CudfOperatorBase> buffer;
+  if (reduce) {
+    buffer = std::make_unique<CudfReduce>(
+        1,
+        driver->driverCtx(),
+        std::dynamic_pointer_cast<const core::AggregationNode>(plan));
+  } else {
+    buffer = std::make_unique<CudfHashJoinBuild>(
+        1,
+        driver->driverCtx(),
+        std::dynamic_pointer_cast<const core::HashJoinNode>(plan));
+  }
   project.initialize();
-  build.initialize();
+  buffer->initialize();
   cuda::stream stream{cuda::device_ref{0}};
   ASSERT_FALSE(outputStatsMr_);
   const auto baseline = cudfAllocatedBytes();
@@ -212,7 +234,7 @@ TEST_F(CudfCteTest, narrowSharedProjectionDoesNotRetainWideJoinBuildInput) {
     wideBytes = original->estimateFlatSize();
     project.addInput(original->shareForRead(pool()));
     original.reset();
-    build.addInput(project.getOutput());
+    buffer->addInput(project.getOutput());
     CUDF_CUDA_TRY(cudaDeviceSynchronize());
   }
   const auto retained = cudfAllocatedBytes() - baseline;
@@ -220,15 +242,30 @@ TEST_F(CudfCteTest, narrowSharedProjectionDoesNotRetainWideJoinBuildInput) {
   const auto elapsed = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - start)
                            .count();
-  std::cout << "NARROW_JOIN_BUILD batches=" << kBatches << " rows=" << kRows
+  std::cout << (reduce ? "NARROW_REDUCE" : "NARROW_JOIN_BUILD")
+            << " batches=" << kBatches << " rows=" << kRows
             << " wide_batch_bytes=" << wideBytes
             << " retained_bytes=" << retained
             << " peak_extra_bytes=" << counters.peak
             << " elapsed_ms=" << elapsed << std::endl;
   // Two of twenty columns remain; allow padding without retaining all twenty.
   EXPECT_LT(retained, wideBytes * kBatches / 4);
+  if (reduce) {
+    buffer->noMoreInput();
+    auto output = std::dynamic_pointer_cast<CudfVector>(buffer->getOutput());
+    ASSERT_NE(output, nullptr);
+    auto actual = with_arrow::toVeloxColumn(
+        output->getTableView(),
+        pool(),
+        output->type(),
+        output->stream(),
+        get_output_mr());
+    auto expected = makeRowVector({makeFlatVector<int64_t>(
+        {int64_t(kBatches) * kRows * (kRows - 1) / 2})});
+    facebook::velox::test::assertEqualVectors(expected, actual);
+  }
   project.close();
-  build.close();
+  buffer->close();
   CUDF_CUDA_TRY(cudaDeviceSynchronize());
   EXPECT_EQ(cudfAllocatedBytes(), baseline);
 }
