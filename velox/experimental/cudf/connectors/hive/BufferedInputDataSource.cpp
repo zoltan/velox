@@ -151,6 +151,10 @@ class HostUpload {
     recorded_ = true;
   }
 
+  cudaStream_t stream() const {
+    return stream_.get();
+  }
+
   bool ready() {
     const auto status = cudaEventQuery(event_);
     complete_ = status == cudaSuccess;
@@ -167,10 +171,9 @@ class HostUpload {
   bool complete_{false};
 };
 
-// Polls completions independently of the IO executor. Scan every outstanding
-// event so a stalled stream cannot delay releasing buffers from other streams.
-// Buffer destructors may call CUDA (e.g. cudaFreeHost), excluding host
-// callbacks.
+// Poll only each stream's oldest pending owner, draining its ready prefix.
+// A blocked stream cannot postpone retirement on another stream. Buffer
+// destructors may call CUDA (e.g. cudaFreeHost), excluding host callbacks.
 class UploadRetirement {
  public:
   UploadRetirement() : worker_([this] { run(); }) {}
@@ -185,53 +188,78 @@ class UploadRetirement {
   }
 
   void add(std::unique_ptr<HostUpload> upload) {
+    bool wake;
     {
       std::lock_guard lock(mutex_);
       uploads_.push_back(std::move(upload));
+      wake = !polling_;
     }
-    changed_.notify_one();
+    if (wake) {
+      changed_.notify_one();
+    }
   }
 
  private:
+  using Uploads = std::list<std::unique_ptr<HostUpload>>;
+
   void run() noexcept {
-    std::list<std::unique_ptr<HostUpload>> pending;
+    std::unordered_map<cudaStream_t, Uploads> pending;
     for (;;) {
+      Uploads incoming;
+      bool stopping;
       {
         std::unique_lock lock(mutex_);
-        if (pending.empty()) {
+        polling_ = !pending.empty();
+        if (!polling_) {
           changed_.wait(lock, [&] { return stopping_ || !uploads_.empty(); });
         } else {
-          changed_.wait_for(lock, std::chrono::milliseconds(1), [&] {
-            return stopping_ || !uploads_.empty();
-          });
+          // New uploads join the next poll; only shutdown interrupts the timer.
+          changed_.wait_for(
+              lock, std::chrono::milliseconds(1), [&] { return stopping_; });
         }
-        pending.splice(pending.end(), uploads_);
-        if (stopping_) {
-          break;
-        }
+        incoming.splice(incoming.end(), uploads_);
+        stopping = stopping_;
+        polling_ = true;
       }
-      // Both CUDA calls and arbitrary buffer destructors stay outside the lock.
+      // CUDA calls and arbitrary buffer destructors stay outside the lock.
       try {
         ensureCudaContextForThread();
+        while (!incoming.empty()) {
+          auto& queue = pending[incoming.front()->stream()];
+          queue.splice(queue.end(), incoming, incoming.begin());
+        }
+        if (stopping) {
+          break;
+        }
         for (auto it = pending.begin(); it != pending.end();) {
-          if ((*it)->ready()) {
+          auto& queue = it->second;
+          // Concurrent submitters can enqueue in a different order from event
+          // recording. Check each owner before dropping it, even in a FIFO.
+          while (!queue.empty() && queue.front()->ready()) {
+            queue.pop_front();
+          }
+          if (queue.empty()) {
             it = pending.erase(it);
           } else {
             ++it;
           }
         }
       } catch (...) {
-        // Each owner conservatively drains or retains its allocation on error.
+        // Owners conservatively drain or retain allocations on failure.
         pending.clear();
       }
+      if (stopping) {
+        break;
+      }
     }
-    // Process shutdown drains accepted uploads before destroying the service.
+    // Shutdown drains accepted uploads before destroying the service.
   }
 
   std::mutex mutex_;
   std::condition_variable changed_;
-  std::list<std::unique_ptr<HostUpload>> uploads_;
+  Uploads uploads_;
   bool stopping_{false};
+  bool polling_{false};
   std::thread worker_;
 };
 

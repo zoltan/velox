@@ -39,6 +39,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <thread>
@@ -648,6 +649,134 @@ TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
 
 TEST_F(GpuInputCacheTest, uncachedUploadsDoNotBlockIoExecutor) {
   testUploadRetirement(false);
+}
+
+// Manual retirement benchmark: 64 pinned reads per stream, held behind a
+// device gate. All source bytes stay allocated outside the measured interval.
+TEST_F(GpuInputCacheTest, DISABLED_uploadRetirementScaling) {
+  constexpr size_t kBytes = 64;
+  constexpr int kReads = 64;
+  class Source final : public connector::hive::BufferedInputDataSource {
+   public:
+    explicit Source(std::shared_ptr<CacheableInput> input)
+        : BufferedInputDataSource(std::move(input)) {
+      GpuEncodedCache::check(cudaMallocHost(&data_, kBytes));
+      std::memset(data_, 0x5a, kBytes);
+    }
+    ~Source() override {
+      cudaFreeHost(data_);
+    }
+    std::unique_ptr<buffer> host_read(size_t, size_t) override {
+      class Buffer final : public buffer {
+       public:
+        Buffer(const uint8_t* data, std::atomic<int>& live)
+            : data_(data), live_(live) {
+          ++live_;
+        }
+        ~Buffer() override {
+          --live_;
+        }
+        const uint8_t* data() const override {
+          return data_;
+        }
+        size_t size() const override {
+          return kBytes;
+        }
+
+       private:
+        const uint8_t* data_;
+        std::atomic<int>& live_;
+      };
+      return std::make_unique<Buffer>(static_cast<uint8_t*>(data_), live);
+    }
+    std::atomic<int> live{0};
+
+   private:
+    void* data_{};
+  };
+  setEncodedInputGpuCache(nullptr);
+  auto pool = memory::memoryManager()->addLeafPool();
+  auto input = std::make_shared<CacheableInput>(
+      std::make_shared<InMemoryReadFile>(std::string(kBytes, 'x')),
+      *pool,
+      false);
+  auto source = std::make_shared<Source>(input);
+  auto upstream = createMemoryResource("cuda", 0);
+  for (int drivers : {1, 16, 64}) {
+    std::vector<std::unique_ptr<rmm::cuda_stream>> streams;
+    std::vector<rmm::device_buffer> destinations;
+    for (int driver = 0; driver < drivers; ++driver) {
+      streams.push_back(std::make_unique<rmm::cuda_stream>());
+      destinations.emplace_back(kBytes, *streams.back(), upstream);
+      streams.back()->synchronize();
+    }
+    std::promise<void> unblock;
+    auto gate = unblock.get_future().share();
+    for (const auto& stream : streams) {
+      GpuEncodedCache::check(cudaLaunchHostFunc(
+          stream->value(),
+          [](void* value) {
+            static_cast<std::shared_future<void>*>(value)->wait();
+          },
+          &gate));
+    }
+    SCOPE_EXIT {
+      if (gate.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        unblock.set_value();
+      }
+    };
+    std::promise<void> start;
+    auto startGate = start.get_future().share();
+    std::vector<std::future<void>> workers;
+    for (int driver = 0; driver < drivers; ++driver) {
+      workers.push_back(std::async(std::launch::async, [&, driver] {
+        ensureCudaContextForThread();
+        startGate.wait();
+        for (int read = 0; read < kReads; ++read) {
+          VELOX_CHECK_EQ(
+              source
+                  ->device_read_async(
+                      0,
+                      kBytes,
+                      static_cast<uint8_t*>(destinations[driver].data()),
+                      *streams[driver])
+                  .get(),
+              kBytes);
+        }
+      }));
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    start.set_value();
+    for (auto& worker : workers) {
+      worker.get();
+    }
+    const auto submitted = std::chrono::steady_clock::now();
+    EXPECT_EQ(source->live.load(), drivers * kReads);
+    unblock.set_value();
+    for (const auto& stream : streams) {
+      stream->synchronize();
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (source->live.load() != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto finished = std::chrono::steady_clock::now();
+    EXPECT_EQ(source->live.load(), 0);
+    for (auto& destination : destinations) {
+      uint8_t value = 0;
+      GpuEncodedCache::check(
+          cudaMemcpy(&value, destination.data(), 1, cudaMemcpyDeviceToHost));
+      EXPECT_EQ(value, 0x5a);
+    }
+    std::cout << "UPLOAD_RETIRE drivers=" << drivers
+              << " reads=" << drivers * kReads << " submit_seconds="
+              << std::chrono::duration<double>(submitted - begin).count()
+              << " drain_seconds="
+              << std::chrono::duration<double>(finished - submitted).count()
+              << std::endl;
+  }
 }
 
 TEST_F(GpuInputCacheTest, coalescedMissesHaveBoundedHostReads) {

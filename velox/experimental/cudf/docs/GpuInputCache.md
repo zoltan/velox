@@ -85,7 +85,10 @@ read failure cannot fail an unrelated query.
 Cached and uncached uploads share one completion-retirement service. Each read
 records an event immediately after its copies and transfers its host buffer to
 a dedicated polling thread. Neither the driver nor an IO worker waits for normal
-upload retirement. The poller checks all pending events, so an incomplete stream
+upload retirement. The poller checks each stream's oldest pending event and drains its ready
+prefix. New uploads join the next 1 ms poll instead of waking an active poller.
+Each owner is checked independently because concurrent submissions can enqueue
+owners in a different order from event recording. An incomplete stream
 does not prevent observing completion on another stream. Buffer destruction runs
 outside the queue lock and outside CUDA callbacks; destructors may call CUDA.
 Completed events return to the submitting thread's pool, which retains at most
