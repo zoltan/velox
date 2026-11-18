@@ -209,6 +209,7 @@ TEST_F(CudfCteTest, sharedStorageReuse) {
   producer.sync();
   first.sync();
   second.sync();
+  const auto baseline = cudfAllocatedBytes();
   statsMr_->push_counters();
   const auto begin = std::chrono::steady_clock::now();
   for (int i = 0; i < iterations; ++i) {
@@ -238,6 +239,7 @@ TEST_F(CudfCteTest, sharedStorageReuse) {
       std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
           .count();
   const auto counters = statsMr_->pop_counters().first;
+  EXPECT_EQ(cudfAllocatedBytes(), baseline);
   std::cout << "CTE_REUSE resource=" << CudfConfig::getInstance().memoryResource
             << " iterations=" << iterations << " seconds=" << seconds
             << " peak_increment=" << counters.peak
