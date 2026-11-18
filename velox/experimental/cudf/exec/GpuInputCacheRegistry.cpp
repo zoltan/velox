@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
-#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
 
 #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/memory/SharedArbitrator.h"
@@ -23,14 +23,14 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 std::mutex cacheMutex;
-std::weak_ptr<GpuEncodedCache> processCache;
-std::shared_ptr<GpuEncodedCache> registeredCache;
+std::weak_ptr<GpuInputCache> processCache;
+std::shared_ptr<GpuInputCache> registeredCache;
 } // namespace
-void setEncodedInputGpuCache(const std::shared_ptr<GpuEncodedCache>& cache) {
+void setGpuInputCache(const std::shared_ptr<GpuInputCache>& cache) {
   std::lock_guard lock(cacheMutex);
   processCache = cache;
 }
-void initializeEncodedInputGpuCache(bool enabled) {
+void initializeGpuInputCache(bool enabled) {
   auto resource = cudfCustomMemoryResource();
   if (!enabled || !cache::AsyncDataCache::getInstance() || !resource || !mr_) {
     return;
@@ -44,12 +44,12 @@ void initializeEncodedInputGpuCache(bool enabled) {
   if (!processCache.expired()) {
     return;
   }
-  registeredCache = std::make_shared<GpuEncodedCache>(resource, *mr_);
+  registeredCache = GpuInputCache::create(resource, *mr_);
   processCache = registeredCache;
 }
 
-void resetEncodedInputGpuCache() {
-  std::shared_ptr<GpuEncodedCache> previous;
+void resetGpuInputCache() {
+  std::shared_ptr<GpuInputCache> previous;
   {
     std::lock_guard lock(cacheMutex);
     processCache.reset();
@@ -59,7 +59,7 @@ void resetEncodedInputGpuCache() {
   previous.reset();
 }
 
-std::shared_ptr<GpuEncodedCache> encodedInputGpuCache() {
+std::shared_ptr<GpuInputCache> gpuInputCache() {
   std::lock_guard lock(cacheMutex);
   return processCache.lock();
 }

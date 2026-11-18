@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
 #include "velox/experimental/gpu/DeviceReadSource.h"
 
 #include "velox/common/caching/StringIdMap.h"
@@ -97,7 +97,7 @@ class BufferedInputDataSource
   std::shared_ptr<IoStats> ioStats_;
   // Keep the immutable file generation alive even when host bytes are evicted.
   std::shared_ptr<const StringIdLease> fileIdentity_;
-  std::shared_ptr<GpuEncodedCache> deviceCache_;
+  std::shared_ptr<GpuInputCache> deviceCache_;
 };
 
 } // namespace facebook::velox::cudf_velox::connector::hive

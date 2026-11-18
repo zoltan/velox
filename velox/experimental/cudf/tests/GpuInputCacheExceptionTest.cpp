@@ -15,7 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
-#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCache.h"
 
 #include <rmm/cuda_stream.hpp>
 
@@ -108,6 +108,7 @@ enum class Scenario {
   ReleaseEvent,
   EvictionAllocation,
   EvictionEvent,
+  DestructorEvent,
 };
 
 [[noreturn]] void runScenario(Scenario scenario) {
@@ -115,18 +116,17 @@ enum class Scenario {
   memory::MemoryManager::initialize({});
   setCudfContextDevice(0);
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
-  auto cache = std::make_shared<GpuEncodedCache>(
-      resource, createMemoryResource("cuda", 0));
+  auto cache = GpuInputCache::create(resource, createMemoryResource("cuda", 0));
   rmm::cuda_stream stream;
   constexpr uint64_t bytes = 8L << 20;
   auto fill = [&](void* dst) {
-    GpuEncodedCache::check(cudaMemsetAsync(dst, 42, bytes, stream.value()));
+    GpuInputCache::check(cudaMemsetAsync(dst, 42, bytes, stream.value()));
     if (scenario == Scenario::CreatorAllocation) {
       failAllocation = true;
     }
   };
 
-  GpuEncodedCache::LeasePtr lease;
+  GpuInputCache::LeasePtr lease;
   try {
     lease = cache->getOrFill("entry", bytes, stream.value(), fill);
   } catch (const std::bad_alloc&) {
@@ -153,7 +153,7 @@ enum class Scenario {
   std::atomic<bool> consumed{false};
   if (scenario == Scenario::ReleaseAllocation ||
       scenario == Scenario::ReleaseEvent) {
-    GpuEncodedCache::check(cudaLaunchHostFunc(
+    GpuInputCache::check(cudaLaunchHostFunc(
         stream.value(),
         [](void* ptr) {
           std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -166,6 +166,11 @@ enum class Scenario {
   lease.reset();
   failAllocation = failRecord = false;
 
+  if (scenario == Scenario::DestructorEvent) {
+    failQuery = true;
+    cache.reset();
+    std::_Exit(injected ? 0 : 16);
+  }
   uint64_t freed = 0;
   failAllocation = scenario == Scenario::EvictionAllocation;
   failQuery = scenario == Scenario::EvictionEvent;
@@ -202,47 +207,52 @@ enum class Scenario {
   std::_Exit(0);
 }
 
-class GpuEncodedCacheExceptionTest : public testing::Test {
+class GpuInputCacheExceptionTest : public testing::Test {
  protected:
   void SetUp() override {
     testing::FLAGS_gtest_death_test_style = "threadsafe";
   }
 };
 
-TEST_F(GpuEncodedCacheExceptionTest, hitAllocationRollsBackPin) {
+TEST_F(GpuInputCacheExceptionTest, hitAllocationRollsBackPin) {
   EXPECT_EXIT(
       runScenario(Scenario::HitAllocation), testing::ExitedWithCode(0), "");
 }
 
-TEST_F(GpuEncodedCacheExceptionTest, hitWaitFailureRollsBackPin) {
+TEST_F(GpuInputCacheExceptionTest, hitWaitFailureRollsBackPin) {
   EXPECT_EXIT(runScenario(Scenario::HitWait), testing::ExitedWithCode(0), "");
 }
 
-TEST_F(GpuEncodedCacheExceptionTest, creatorMetadataFailureRetainsOwnership) {
+TEST_F(GpuInputCacheExceptionTest, creatorMetadataFailureRetainsOwnership) {
   EXPECT_EXIT(
       runScenario(Scenario::CreatorAllocation), testing::ExitedWithCode(0), "");
 }
 
-TEST_F(GpuEncodedCacheExceptionTest, releaseNeedsNoHostAllocation) {
+TEST_F(GpuInputCacheExceptionTest, releaseNeedsNoHostAllocation) {
   EXPECT_EXIT(
       runScenario(Scenario::ReleaseAllocation), testing::ExitedWithCode(0), "");
 }
 
-TEST_F(GpuEncodedCacheExceptionTest, releaseEventFailureWaitsForConsumer) {
+TEST_F(GpuInputCacheExceptionTest, releaseEventFailureWaitsForConsumer) {
   EXPECT_EXIT(
       runScenario(Scenario::ReleaseEvent), testing::ExitedWithCode(0), "");
 }
 
-TEST_F(GpuEncodedCacheExceptionTest, evictionMetadataFailureRetainsVictims) {
+TEST_F(GpuInputCacheExceptionTest, evictionMetadataFailureRetainsVictims) {
   EXPECT_EXIT(
       runScenario(Scenario::EvictionAllocation),
       testing::ExitedWithCode(0),
       "");
 }
 
-TEST_F(GpuEncodedCacheExceptionTest, evictionEventFailureRetainsVictims) {
+TEST_F(GpuInputCacheExceptionTest, evictionEventFailureRetainsVictims) {
   EXPECT_EXIT(
       runScenario(Scenario::EvictionEvent), testing::ExitedWithCode(0), "");
 }
+TEST_F(GpuInputCacheExceptionTest, destructorRetainsFailedDeviceAllocations) {
+  EXPECT_EXIT(
+      runScenario(Scenario::DestructorEvent), testing::ExitedWithCode(0), "");
+}
+
 } // namespace
 } // namespace facebook::velox::cudf_velox

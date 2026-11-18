@@ -18,8 +18,8 @@ add_library(
   CudfMemoryArbitration.cpp
   CudfMemoryResource.cpp
   GpuResources.cpp
-  GpuEncodedCache.cpp
-  EncodedInputGpuCache.cpp
+  GpuInputCache.cpp
+  GpuInputCacheRegistry.cpp
   ../io/CachedDeviceRead.cpp
 )
 target_link_libraries(

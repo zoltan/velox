@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudaEventPool.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
@@ -73,73 +74,6 @@ class HostReadBuffer final : public cudf::io::datasource::buffer {
   std::vector<uint8_t> buffer_;
 };
 
-// Reuse completion events from one submitting thread. Completed uploads can
-// return them from the retirement thread; owners keep the pool alive after the
-// IO thread exits. Limit retained handles independently of outstanding reads.
-class UploadEvents {
- public:
-  explicit UploadEvents(int device) : device_(device) {
-    events_.reserve(kMaxIdle);
-  }
-
-  ~UploadEvents() {
-    int previous;
-    if (cudaGetDevice(&previous) != cudaSuccess ||
-        cudaSetDevice(device_) != cudaSuccess) {
-      return;
-    }
-    for (auto event : events_) {
-      cudaEventDestroy(event);
-    }
-    cudaSetDevice(previous);
-  }
-
-  int device() const {
-    return device_;
-  }
-
-  cudaEvent_t acquire() {
-    {
-      std::lock_guard lock(mutex_);
-      if (!events_.empty()) {
-        auto event = events_.back();
-        events_.pop_back();
-        return event;
-      }
-    }
-    cudaEvent_t event;
-    CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-    return event;
-  }
-
-  void release(cudaEvent_t event) noexcept {
-    {
-      std::lock_guard lock(mutex_);
-      if (events_.size() < kMaxIdle) {
-        events_.push_back(event);
-        return;
-      }
-    }
-    cudaEventDestroy(event);
-  }
-
- private:
-  static constexpr size_t kMaxIdle = 64;
-  const int device_;
-  std::mutex mutex_;
-  std::vector<cudaEvent_t> events_;
-};
-
-std::shared_ptr<UploadEvents> uploadEvents() {
-  static thread_local std::shared_ptr<UploadEvents> events;
-  int device;
-  CUDF_CUDA_TRY(cudaGetDevice(&device));
-  if (!events || events->device() != device) {
-    events = std::make_shared<UploadEvents>(device);
-  }
-  return events;
-}
-
 // Retains a host allocation until the copies using it complete. Error paths
 // drain synchronously; the normal path hands ownership to UploadRetirement.
 class HostUpload {
@@ -149,7 +83,7 @@ class HostUpload {
       cuda::stream_ref stream)
       : buffer_(std::move(buffer)), stream_(stream) {
     ensureCudaContextForThread();
-    events_ = uploadEvents();
+    events_ = CudaEventPool::get();
     event_ = events_->acquire();
   }
 
@@ -198,7 +132,7 @@ class HostUpload {
  private:
   std::unique_ptr<cudf::io::datasource::buffer> buffer_;
   cuda::stream_ref stream_;
-  std::shared_ptr<UploadEvents> events_;
+  std::shared_ptr<CudaEventPool> events_;
   cudaEvent_t event_{};
   bool recorded_{false};
   bool complete_{false};
@@ -350,8 +284,7 @@ BufferedInputDataSource::BufferedInputDataSource(
       ioStats_(std::move(ioStats)),
       fileIdentity_(std::move(fileIdentity)),
       deviceCache_(
-          input_->hasCache() && fileIdentity_ ? encodedInputGpuCache()
-                                              : nullptr) {}
+          input_->hasCache() && fileIdentity_ ? gpuInputCache() : nullptr) {}
 
 void BufferedInputDataSource::recordBytes(const char* name, uint64_t bytes) {
   if (ioStats_) {
@@ -459,7 +392,7 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
     rmm::device_async_resource_ref temporaryResource) {
   struct Owner {
     std::shared_ptr<BufferedInputDataSource> source;
-    std::vector<GpuEncodedCache::LeasePtr> leases;
+    std::vector<GpuInputCache::LeasePtr> leases;
     std::vector<bool> created;
     std::vector<std::future<size_t>> pending;
     std::vector<size_t> expected;
@@ -532,7 +465,7 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
   std::vector<size_t> bypassIndices;
   bypass.reserve(ranges.size());
   bypassIndices.reserve(ranges.size());
-  std::unordered_map<std::string, GpuEncodedCache::LeasePtr> reservations;
+  std::unordered_map<std::string, GpuInputCache::LeasePtr> reservations;
   try {
     for (size_t i = 0; i < ranges.size(); ++i) {
       const auto& range = ranges[i];
@@ -622,7 +555,7 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
         bytes += ranges[end].size();
         ++end;
       }
-      std::vector<GpuEncodedCache::LeasePtr> fillLeases(
+      std::vector<GpuInputCache::LeasePtr> fillLeases(
           owner->leases.begin() + i, owner->leases.begin() + end);
       owner->expected.push_back(bytes);
       owner->pending.push_back(submitDeviceRead(

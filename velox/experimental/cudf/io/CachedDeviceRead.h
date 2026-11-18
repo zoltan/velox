@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCache.h"
 #include "velox/experimental/gpu/DeviceReadSource.h"
 
 #include <limits>
@@ -38,16 +38,16 @@ struct CachedDeviceRead {
 /// A supplied lease must match that allocation size.
 /// A rejected admission returns an empty batch; the caller retains its existing
 /// allocation/coalescing policy for bypass. fill must enqueue on producer and
-/// retain host sources until DMA completes, just as GpuEncodedCache requires.
+/// retain host sources until DMA completes, just as GpuInputCache requires.
 /// An optional prior lookup lets batch readers prefetch only missing ranges.
 CachedDeviceRead readCachedDeviceRange(
-    const std::shared_ptr<GpuEncodedCache>& cache,
+    const std::shared_ptr<GpuInputCache>& cache,
     const std::string& key,
     uint64_t bytes,
     uint64_t padding,
     cuda::stream_ref producer,
     const std::function<void(void*)>& fill,
     std::shared_ptr<const void> identity = nullptr,
-    GpuEncodedCache::LeasePtr lease = nullptr);
+    GpuInputCache::LeasePtr lease = nullptr);
 
 } // namespace facebook::velox::cudf_velox

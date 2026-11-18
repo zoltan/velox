@@ -16,16 +16,16 @@
 #pragma once
 #include <memory>
 namespace facebook::velox::cudf_velox {
-class GpuEncodedCache;
+class GpuInputCache;
 /// Install the process cache for immutable encoded input. The caller owns it.
 /// Readers use it when CPU AsyncDataCache is also available.
-void setEncodedInputGpuCache(const std::shared_ptr<GpuEncodedCache>& cache);
+void setGpuInputCache(const std::shared_ptr<GpuInputCache>& cache);
 /// Install a registration-owned cache when host caching and an accounted GPU
 /// backend are available. An explicitly installed cache takes precedence.
-void initializeEncodedInputGpuCache(bool enabled);
+void initializeGpuInputCache(bool enabled);
 /// Release registration ownership and unpublish the cache during cuDF shutdown.
 /// Readers and queries must have finished before unregistering cuDF.
-void resetEncodedInputGpuCache();
+void resetGpuInputCache();
 /// Return the installed cache, or nullptr if absent or no longer owned.
-std::shared_ptr<GpuEncodedCache> encodedInputGpuCache();
+std::shared_ptr<GpuInputCache> gpuInputCache();
 } // namespace facebook::velox::cudf_velox

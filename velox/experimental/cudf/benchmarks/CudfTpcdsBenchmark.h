@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCache.h"
 
 #include "velox/benchmarks/tpcds/TpcdsBenchmark.h"
 
@@ -53,5 +53,5 @@ class CudfTpcdsBenchmark : public TpcdsBenchmark {
   // Outlives all query contexts created by the sequence harness.
   std::unique_ptr<folly::CPUThreadPoolExecutor> queryExecutor_;
   // Shares the GPU budget with query operators and outlives all input leases.
-  std::shared_ptr<facebook::velox::cudf_velox::GpuEncodedCache> deviceCache_;
+  std::shared_ptr<facebook::velox::cudf_velox::GpuInputCache> deviceCache_;
 };

@@ -407,8 +407,8 @@ velox_add_cudf_test(
 
 # Keep allocation and CUDA fault injection in a dedicated process.
 velox_add_cudf_test(
-  NAME velox_cudf_gpu_encoded_cache_exception_test
-  SOURCES Main.cpp GpuEncodedCacheExceptionTest.cpp
+  NAME velox_cudf_gpu_input_cache_exception_test
+  SOURCES Main.cpp GpuInputCacheExceptionTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} ${CMAKE_DL_LIBS}
 )
 

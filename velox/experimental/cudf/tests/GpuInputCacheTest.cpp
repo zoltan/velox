@@ -15,10 +15,10 @@
  */
 
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
-#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
-#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
-#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/io/CachedDeviceRead.h"
+#include "velox/experimental/cudf/exec/GpuInputCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/File.h"
@@ -59,7 +59,7 @@ TEST_F(GpuInputCacheTest, ShardedCachePinsAndStreamCompletion) {
   setCudfContextDevice(0);
   auto owner = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(owner, upstream, true);
+  auto cache = GpuInputCache::create(owner, upstream, true);
   cudaStream_t producer, consumer;
   ASSERT_EQ(
       cudaStreamCreateWithFlags(&producer, cudaStreamNonBlocking), cudaSuccess);
@@ -67,7 +67,7 @@ TEST_F(GpuInputCacheTest, ShardedCachePinsAndStreamCompletion) {
       cudaStreamCreateWithFlags(&consumer, cudaStreamNonBlocking), cudaSuccess);
   auto lease =
       cache->getOrFill("generation:range", 8L << 20, producer, [&](void* p) {
-        GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20, producer));
+        GpuInputCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20, producer));
       });
   ASSERT_TRUE(lease);
   auto second = cache->get("generation:range", consumer);
@@ -76,7 +76,7 @@ TEST_F(GpuInputCacheTest, ShardedCachePinsAndStreamCompletion) {
   EXPECT_EQ(cache->evict(8L << 20), 0);
   lease->handoffTo(consumer);
   unsigned char value = 0;
-  GpuEncodedCache::check(cudaMemcpyAsync(
+  GpuInputCache::check(cudaMemcpyAsync(
       &value, lease->data(), 1, cudaMemcpyDeviceToHost, consumer));
   lease.reset();
   EXPECT_EQ(cache->evict(8L << 20), 0);
@@ -93,11 +93,10 @@ TEST_F(GpuInputCacheTest, ShardedCachePinsAndStreamCompletion) {
 TEST_F(GpuInputCacheTest, abortedCacheReleasesIdleAndBypassesAdmission) {
   auto resource = createCudfCustomMemoryResource(32L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  auto cache = GpuInputCache::create(resource, upstream);
   rmm::cuda_stream stream;
   auto fill = [&](void* data) {
-    GpuEncodedCache::check(
-        cudaMemsetAsync(data, 0x2a, 8L << 20, stream.value()));
+    GpuInputCache::check(cudaMemsetAsync(data, 0x2a, 8L << 20, stream.value()));
   };
   auto pinned = cache->getOrFill("pinned", 8L << 20, stream.value(), fill);
   auto idle = cache->getOrFill("idle", 8L << 20, stream.value(), fill);
@@ -110,7 +109,7 @@ TEST_F(GpuInputCacheTest, abortedCacheReleasesIdleAndBypassesAdmission) {
   EXPECT_NO_THROW(EXPECT_EQ(
       cache->getOrFill("new", 8L << 20, stream.value(), fill), nullptr));
   uint8_t value = 0;
-  GpuEncodedCache::check(cudaMemcpyAsync(
+  GpuInputCache::check(cudaMemcpyAsync(
       &value, pinned->data(), 1, cudaMemcpyDeviceToHost, stream.value()));
   stream.synchronize();
   EXPECT_EQ(value, 0x2a);
@@ -121,11 +120,10 @@ TEST_F(GpuInputCacheTest, abortedCacheReleasesIdleAndBypassesAdmission) {
 TEST_F(GpuInputCacheTest, admissionReplacesOnlyIdleEntries) {
   auto resource = createCudfCustomMemoryResource(16L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  auto cache = GpuInputCache::create(resource, upstream);
   rmm::cuda_stream stream;
   auto fill = [&](void* data) {
-    GpuEncodedCache::check(
-        cudaMemsetAsync(data, 0x37, 8L << 20, stream.value()));
+    GpuInputCache::check(cudaMemsetAsync(data, 0x37, 8L << 20, stream.value()));
   };
   auto pinned = cache->getOrFill("pinned", 8L << 20, stream.value(), fill);
   auto idle = cache->getOrFill("idle", 8L << 20, stream.value(), fill);
@@ -144,18 +142,18 @@ TEST_F(GpuInputCacheTest, ShardedCacheCoalescesConcurrentFill) {
   setCudfContextDevice(0);
   auto owner = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(owner, upstream, true);
+  auto cache = GpuInputCache::create(owner, upstream, true);
   std::promise<void> entered, finish;
   auto gate = finish.get_future().share();
   auto creator = std::async(std::launch::async, [&] {
     ensureCudaContextForThread();
     cudaStream_t stream;
-    GpuEncodedCache::check(
+    GpuInputCache::check(
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     auto lease = cache->getOrFill("same", 8L << 20, stream, [&](void* p) {
       entered.set_value();
       gate.wait();
-      GpuEncodedCache::check(cudaMemsetAsync(p, 0x39, 8L << 20, stream));
+      GpuInputCache::check(cudaMemsetAsync(p, 0x39, 8L << 20, stream));
     });
     auto* ptr = lease->data();
     lease.reset();
@@ -166,15 +164,15 @@ TEST_F(GpuInputCacheTest, ShardedCacheCoalescesConcurrentFill) {
   auto waiter = std::async(std::launch::async, [&] {
     ensureCudaContextForThread();
     cudaStream_t stream;
-    GpuEncodedCache::check(
+    GpuInputCache::check(
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     auto lease = cache->getOrFill("same", 8L << 20, stream, [&](void*) {
       ADD_FAILURE() << "duplicate fill";
     });
     unsigned char byte = 0;
-    GpuEncodedCache::check(cudaMemcpyAsync(
+    GpuInputCache::check(cudaMemcpyAsync(
         &byte, lease->data(), 1, cudaMemcpyDeviceToHost, stream));
-    GpuEncodedCache::check(cudaStreamSynchronize(stream));
+    GpuInputCache::check(cudaStreamSynchronize(stream));
     EXPECT_EQ(byte, 0x39);
     auto* ptr = lease->data();
     lease.reset();
@@ -228,8 +226,8 @@ void runCoalescedFillInterruption(FillInterruption interruption) {
           return prototype->newReclaimer(context);
         },
         prototype->maxCapacity());
-    auto cache = std::make_shared<GpuEncodedCache>(
-        resource, createMemoryResource("cuda", 0));
+    auto cache =
+        GpuInputCache::create(resource, createMemoryResource("cuda", 0));
     auto pool = memory::memoryManager()->addLeafPool();
     auto values = std::make_shared<RowVector>(
         pool.get(), ROW({}), nullptr, 1, std::vector<VectorPtr>{});
@@ -262,7 +260,7 @@ void runCoalescedFillInterruption(FillInterruption interruption) {
       return runDriver(0, [&](rmm::cuda_stream& stream) {
         auto lease = cache->getOrFill(
             "shared", 8L << 20, stream.value(), [&](void* destination) {
-              GpuEncodedCache::check(
+              GpuInputCache::check(
                   cudaMemsetAsync(destination, 0x39, 8L << 20, stream.value()));
             });
         if (failAllocation) {
@@ -271,9 +269,9 @@ void runCoalescedFillInterruption(FillInterruption interruption) {
         }
         VELOX_CHECK_NOT_NULL(lease);
         unsigned char byte{0};
-        GpuEncodedCache::check(cudaMemcpyAsync(
+        GpuInputCache::check(cudaMemcpyAsync(
             &byte, lease->data(), 1, cudaMemcpyDeviceToHost, stream.value()));
-        GpuEncodedCache::check(cudaStreamSynchronize(stream.value()));
+        GpuInputCache::check(cudaStreamSynchronize(stream.value()));
         EXPECT_EQ(byte, 0x39);
         auto* address = lease->data();
         lease.reset();
@@ -306,9 +304,9 @@ void runCoalescedFillInterruption(FillInterruption interruption) {
         }
         VELOX_CHECK_NOT_NULL(lease);
         unsigned char byte{0};
-        GpuEncodedCache::check(cudaMemcpyAsync(
+        GpuInputCache::check(cudaMemcpyAsync(
             &byte, lease->data(), 1, cudaMemcpyDeviceToHost, stream.value()));
-        GpuEncodedCache::check(cudaStreamSynchronize(stream.value()));
+        GpuInputCache::check(cudaStreamSynchronize(stream.value()));
         EXPECT_EQ(byte, 0x39);
         auto* address = lease->data();
         lease.reset();
@@ -406,7 +404,7 @@ TEST_F(GpuInputCacheTest, ShardedAdmissionBypassesWithoutSpilling) {
   auto leaf = root->addLeafChild("state");
   CudfMemoryResource query(upstream, leaf);
   auto* data = query.allocate_sync(56L << 20, alignof(std::max_align_t));
-  auto cache = std::make_shared<GpuEncodedCache>(owner, upstream);
+  auto cache = GpuInputCache::create(owner, upstream);
   auto lease = cache->getOrFill(
       "cannot-fit", 16L << 20, nullptr, [](void*) { ADD_FAILURE(); });
   EXPECT_FALSE(lease);
@@ -420,14 +418,13 @@ TEST_F(GpuInputCacheTest, ShardedAdmissionBypassesWithoutSpilling) {
 TEST_F(GpuInputCacheTest, pinnedAdmissionAtParticipantLimitBypasses) {
   setCudfContextDevice(0);
   auto owner = createCudfCustomMemoryResource(64L << 20, true);
-  auto cache =
-      std::make_shared<GpuEncodedCache>(owner, createMemoryResource("cuda", 0));
+  auto cache = GpuInputCache::create(owner, createMemoryResource("cuda", 0));
   auto first = cache->getOrFill("retained", 56L << 20, nullptr, [](void* p) {
-    GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 56L << 20));
+    GpuInputCache::check(cudaMemsetAsync(p, 0x5a, 56L << 20));
   });
   ASSERT_TRUE(first);
   // Keep the old entry pinned: replacement may reclaim only idle entries.
-  GpuEncodedCache::LeasePtr next;
+  GpuInputCache::LeasePtr next;
   EXPECT_NO_THROW(
       next = cache->getOrFill(
           "over-participant-limit", 16L << 20, nullptr, [](void*) {
@@ -442,7 +439,7 @@ TEST_F(GpuInputCacheTest, pinnedAdmissionAtParticipantLimitBypasses) {
   auto retained = cache->get("retained", nullptr);
   ASSERT_TRUE(retained);
   unsigned char value = 0;
-  GpuEncodedCache::check(
+  GpuInputCache::check(
       cudaMemcpy(&value, retained->data(), 1, cudaMemcpyDeviceToHost));
   EXPECT_EQ(value, 0x5a);
   retained.reset();
@@ -455,7 +452,7 @@ TEST_F(GpuInputCacheTest, ShardedFillFailureCanRetry) {
   setCudfContextDevice(0);
   auto owner = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(owner, upstream);
+  auto cache = GpuInputCache::create(owner, upstream);
   EXPECT_THROW(
       cache->getOrFill(
           "retry",
@@ -465,7 +462,7 @@ TEST_F(GpuInputCacheTest, ShardedFillFailureCanRetry) {
       std::runtime_error);
   EXPECT_EQ(cache->pool()->usedBytes(), 0);
   auto lease = cache->getOrFill("retry", 8L << 20, nullptr, [](void* p) {
-    GpuEncodedCache::check(cudaMemsetAsync(p, 7, 8L << 20));
+    GpuInputCache::check(cudaMemsetAsync(p, 7, 8L << 20));
   });
   EXPECT_TRUE(lease);
   lease.reset();
@@ -544,10 +541,10 @@ TEST_F(GpuInputCacheTest, hostStagingIsAccountedUntilBufferRelease) {
 TEST_F(GpuInputCacheTest, coldReadsReturnPendingAndCoalesceMisses) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -574,7 +571,7 @@ TEST_F(GpuInputCacheTest, coldReadsReturnPendingAndCoalesceMisses) {
   }
   for (const auto& view : batch.data) {
     uint8_t byte = 0;
-    GpuEncodedCache::check(cudaMemcpyAsync(
+    GpuInputCache::check(cudaMemcpyAsync(
         &byte, view.data(), 1, cudaMemcpyDeviceToHost, stream.value()));
     stream.synchronize();
     EXPECT_EQ(byte, 'x');
@@ -586,7 +583,7 @@ void testUploadRetirement(bool cacheEnabled, bool unregister = false) {
   class PinnedBuffer final : public cudf::io::datasource::buffer {
    public:
     explicit PinnedBuffer(std::promise<void>& freed) : freed_(freed) {
-      GpuEncodedCache::check(cudaMallocHost(&data_, 8));
+      GpuInputCache::check(cudaMallocHost(&data_, 8));
       std::memset(data_, 'x', 8);
     }
     ~PinnedBuffer() override {
@@ -606,10 +603,10 @@ void testUploadRetirement(bool cacheEnabled, bool unregister = false) {
   };
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cacheEnabled ? cache : nullptr);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cacheEnabled ? cache : nullptr);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -631,7 +628,7 @@ void testUploadRetirement(bool cacheEnabled, bool unregister = false) {
   std::promise<void> unblock;
   auto gate = unblock.get_future();
   source->beforeRead = [&] {
-    GpuEncodedCache::check(cudaLaunchHostFunc(
+    GpuInputCache::check(cudaLaunchHostFunc(
         stream.value(),
         [](void* value) { static_cast<std::future<void>*>(value)->wait(); },
         &gate));
@@ -669,7 +666,7 @@ void testUploadRetirement(bool cacheEnabled, bool unregister = false) {
       freedFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
   freedFuture.get();
   uint8_t value = 0;
-  GpuEncodedCache::check(cudaMemcpyAsync(
+  GpuInputCache::check(cudaMemcpyAsync(
       &value, batch.data[0].data(), 1, cudaMemcpyDeviceToHost, stream.value()));
   stream.synchronize();
   EXPECT_EQ(value, 'x');
@@ -697,7 +694,7 @@ TEST_F(GpuInputCacheTest, DISABLED_uploadRetirementScaling) {
    public:
     explicit Source(std::shared_ptr<CacheableInput> input)
         : BufferedInputDataSource(std::move(input)) {
-      GpuEncodedCache::check(cudaMallocHost(&data_, kBytes));
+      GpuInputCache::check(cudaMallocHost(&data_, kBytes));
       std::memset(data_, 0x5a, kBytes);
     }
     ~Source() override {
@@ -731,7 +728,7 @@ TEST_F(GpuInputCacheTest, DISABLED_uploadRetirementScaling) {
    private:
     void* data_{};
   };
-  setEncodedInputGpuCache(nullptr);
+  setGpuInputCache(nullptr);
   auto pool = memory::memoryManager()->addLeafPool();
   auto input = std::make_shared<CacheableInput>(
       std::make_shared<InMemoryReadFile>(std::string(kBytes, 'x')),
@@ -750,7 +747,7 @@ TEST_F(GpuInputCacheTest, DISABLED_uploadRetirementScaling) {
     std::promise<void> unblock;
     auto gate = unblock.get_future().share();
     for (const auto& stream : streams) {
-      GpuEncodedCache::check(cudaLaunchHostFunc(
+      GpuInputCache::check(cudaLaunchHostFunc(
           stream->value(),
           [](void* value) {
             static_cast<std::shared_future<void>*>(value)->wait();
@@ -803,7 +800,7 @@ TEST_F(GpuInputCacheTest, DISABLED_uploadRetirementScaling) {
     EXPECT_EQ(source->live.load(), 0);
     for (auto& destination : destinations) {
       uint8_t value = 0;
-      GpuEncodedCache::check(
+      GpuInputCache::check(
           cudaMemcpy(&value, destination.data(), 1, cudaMemcpyDeviceToHost));
       EXPECT_EQ(value, 0x5a);
     }
@@ -819,10 +816,10 @@ TEST_F(GpuInputCacheTest, DISABLED_uploadRetirementScaling) {
 TEST_F(GpuInputCacheTest, coalescedMissesHaveBoundedHostReads) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -853,10 +850,10 @@ TEST_F(GpuInputCacheTest, coalescedMissesHaveBoundedHostReads) {
 TEST_F(GpuInputCacheTest, asynchronousFillFailureDrainsAndRetries) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -893,10 +890,10 @@ TEST_F(GpuInputCacheTest, asynchronousFillFailureDrainsAndRetries) {
 TEST_F(GpuInputCacheTest, abandonedAsyncFillCompletesBeforeRelease) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -936,10 +933,10 @@ TEST_F(GpuInputCacheTest, rejectedSubmissionDrainsAcceptedReads) {
   } executor;
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -965,7 +962,7 @@ TEST_F(GpuInputCacheTest, rejectedSubmissionDrainsAcceptedReads) {
     retry.waitOn(stream);
     for (const auto& view : retry.data) {
       uint8_t byte = 0;
-      GpuEncodedCache::check(cudaMemcpyAsync(
+      GpuInputCache::check(cudaMemcpyAsync(
           &byte, view.data(), 1, cudaMemcpyDeviceToHost, stream.value()));
       stream.synchronize();
       EXPECT_EQ(byte, 'x');
@@ -978,10 +975,10 @@ TEST_F(GpuInputCacheTest, rejectedSubmissionDrainsAcceptedReads) {
 TEST_F(GpuInputCacheTest, concurrentAsyncFillBypassesUnfinishedProducer) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -1016,10 +1013,10 @@ TEST_F(GpuInputCacheTest, concurrentAsyncFillBypassesUnfinishedProducer) {
 TEST_F(GpuInputCacheTest, failedFillDoesNotFailAnotherReader) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -1045,7 +1042,7 @@ TEST_F(GpuInputCacheTest, failedFillDoesNotFailAnotherReader) {
   EXPECT_THROW(first.wait(), std::runtime_error);
   ASSERT_NO_THROW(second.waitOn(secondStream));
   uint8_t byte{0};
-  GpuEncodedCache::check(cudaMemcpyAsync(
+  GpuInputCache::check(cudaMemcpyAsync(
       &byte,
       second.data[0].data(),
       1,
@@ -1059,7 +1056,7 @@ TEST_F(GpuInputCacheTest, failedFillDoesNotFailAnotherReader) {
 TEST_F(GpuInputCacheTest, physicalRecoveryDoesNotCountAsGlobalArbitration) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  auto cache = GpuInputCache::create(resource, upstream);
   rmm::cuda_stream stream;
   cache
       ->getOrFill(
@@ -1067,7 +1064,7 @@ TEST_F(GpuInputCacheTest, physicalRecoveryDoesNotCountAsGlobalArbitration) {
           8L << 20,
           stream.value(),
           [&](void* data) {
-            GpuEncodedCache::check(
+            GpuInputCache::check(
                 cudaMemsetAsync(data, 0, 8L << 20, stream.value()));
           })
       .reset();
@@ -1084,14 +1081,12 @@ TEST_F(GpuInputCacheTest, physicalRecoveryDoesNotCountAsGlobalArbitration) {
 
 TEST_F(GpuInputCacheTest, cachedReadKeepsPaddingOutsideLogicalView) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
-  auto cache = std::make_shared<GpuEncodedCache>(
-      resource, createMemoryResource("cuda", 0));
+  auto cache = GpuInputCache::create(resource, createMemoryResource("cuda", 0));
   rmm::cuda_stream stream;
   int fills{0};
   auto fill = [&](void* destination) {
     ++fills;
-    GpuEncodedCache::check(
-        cudaMemsetAsync(destination, 0x39, 5, stream.value()));
+    GpuInputCache::check(cudaMemsetAsync(destination, 0x39, 5, stream.value()));
   };
   auto first = readCachedDeviceRange(cache, "padded", 5, 3, stream, fill);
   auto hit = readCachedDeviceRange(cache, "padded", 5, 3, stream, fill);
@@ -1117,7 +1112,7 @@ TEST_F(GpuInputCacheTest, cachedReadKeepsPaddingOutsideLogicalView) {
   EXPECT_EQ(supplied.outcome, DeviceCacheOutcome::Hit);
   EXPECT_EQ(fills, 1);
   std::array<unsigned char, 8> bytes{};
-  GpuEncodedCache::check(cudaMemcpyAsync(
+  GpuInputCache::check(cudaMemcpyAsync(
       bytes.data(),
       first.batch.data.front().data(),
       bytes.size(),
@@ -1135,12 +1130,11 @@ TEST_F(GpuInputCacheTest, cachedReadKeepsPaddingOutsideLogicalView) {
 
 TEST_F(GpuInputCacheTest, cachedReadRejectsMismatchedSuppliedLease) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
-  auto cache = std::make_shared<GpuEncodedCache>(
-      resource, createMemoryResource("cuda", 0));
+  auto cache = GpuInputCache::create(resource, createMemoryResource("cuda", 0));
   rmm::cuda_stream stream;
   auto lease =
       cache->getOrFill("padded", 8, stream.value(), [&](void* destination) {
-        GpuEncodedCache::check(
+        GpuInputCache::check(
             cudaMemsetAsync(destination, 0, 8, stream.value()));
       });
   VELOX_ASSERT_THROW(
@@ -1154,10 +1148,10 @@ TEST_F(GpuInputCacheTest, cachedReadRejectsMismatchedSuppliedLease) {
 TEST_F(GpuInputCacheTest, retainedParquetInputIsZeroCopyAndPadded) {
   const auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -1183,7 +1177,7 @@ TEST_F(GpuInputCacheTest, retainedParquetInputIsZeroCopyAndPadded) {
   EXPECT_EQ(stats->stats().at("cudfGpuCacheHitBytes").sum, 7);
   EXPECT_EQ(cache->evict(0), 0);
   std::array<unsigned char, 8> bytes{};
-  GpuEncodedCache::check(cudaMemcpyAsync(
+  GpuInputCache::check(cudaMemcpyAsync(
       bytes.data(),
       second.data.front().data(),
       bytes.size(),
@@ -1205,10 +1199,10 @@ TEST_F(GpuInputCacheTest, retainedParquetInputIsZeroCopyAndPadded) {
 TEST_F(GpuInputCacheTest, uncachedHostSourceRetainsCopyPath) {
   const auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-  setEncodedInputGpuCache(cache);
+  auto cache = GpuInputCache::create(resource, upstream);
+  setGpuInputCache(cache);
   SCOPE_EXIT {
-    setEncodedInputGpuCache(nullptr);
+    setGpuInputCache(nullptr);
   };
   auto pool = memory::memoryManager()->addLeafPool();
   StringIdMap ids;
@@ -1232,12 +1226,11 @@ TEST_F(GpuInputCacheTest, uncachedHostSourceRetainsCopyPath) {
 
 TEST_F(GpuInputCacheTest, concurrentEvictionReleasesEachAllocationOnce) {
   auto resource = createCudfCustomMemoryResource(256L << 20, true);
-  auto cache = std::make_shared<GpuEncodedCache>(
-      resource, createMemoryResource("cuda", 0));
+  auto cache = GpuInputCache::create(resource, createMemoryResource("cuda", 0));
   for (int i = 0; i < 64; ++i) {
     ASSERT_TRUE(
         cache->getOrFill(std::to_string(i), 1L << 20, nullptr, [](void* p) {
-          GpuEncodedCache::check(cudaMemsetAsync(p, 0x39, 1L << 20));
+          GpuInputCache::check(cudaMemsetAsync(p, 0x39, 1L << 20));
         }));
   }
   std::vector<std::future<uint64_t>> workers;
@@ -1261,12 +1254,12 @@ TEST_F(GpuInputCacheTest, physicalAllocatorFailureRecoversCacheOnly) {
     cuda::mr::any_resource<cuda::mr::device_accessible> upstream{
         rmm::mr::pool_memory_resource{
             createMemoryResource("cuda", 0), 64L << 20, 64L << 20}};
-    auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
-    GpuEncodedCache::LeasePtr pin;
+    auto cache = GpuInputCache::create(resource, upstream);
+    GpuInputCache::LeasePtr pin;
     for (int i = 0; i < 4; ++i) {
       auto lease =
           cache->getOrFill(std::to_string(i), 12L << 20, nullptr, [](void* p) {
-            GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 12L << 20));
+            GpuInputCache::check(cudaMemsetAsync(p, 0x5a, 12L << 20));
           });
       ASSERT_TRUE(lease);
       if (i == 0) {
@@ -1289,7 +1282,7 @@ TEST_F(GpuInputCacheTest, physicalAllocatorFailureRecoversCacheOnly) {
     EXPECT_GE(cache->snapshot()["freed_bytes"].asInt(), 16L << 20);
     EXPECT_EQ(resource->arbitrator()->stats().numAborted, 0);
     unsigned char byte = 0;
-    GpuEncodedCache::check(
+    GpuInputCache::check(
         cudaMemcpy(&byte, pin->data(), 1, cudaMemcpyDeviceToHost));
     EXPECT_EQ(byte, 0x5a);
     if (asynchronous) {
@@ -1311,11 +1304,11 @@ TEST_F(GpuInputCacheTest, physicalAllocatorFailureRecoversCacheOnly) {
 TEST_F(GpuInputCacheTest, logicalPressureUsesDiscardableStorage) {
   auto resource = createCudfCustomMemoryResource(64L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  auto cache = GpuInputCache::create(resource, upstream);
   for (int i = 0; i < 6; ++i) {
     ASSERT_TRUE(
         cache->getOrFill(std::to_string(i), 8L << 20, nullptr, [](void* p) {
-          GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
+          GpuInputCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
         }));
   }
   auto root =
@@ -1338,15 +1331,15 @@ TEST_F(GpuInputCacheTest, fullDeviceCapacityIsShared) {
   }
   constexpr int64_t kGiB = 1L << 30;
   size_t initialFree = 0, total = 0;
-  GpuEncodedCache::check(cudaMemGetInfo(&initialFree, &total));
+  GpuInputCache::check(cudaMemGetInfo(&initialFree, &total));
   ASSERT_GE(initialFree, 92L * kGiB);
   auto resource = createCudfCustomMemoryResource(90L * kGiB, true);
   rmm::mr::statistics_resource_adaptor tracker(createMemoryResource("cuda", 0));
   cuda::mr::any_resource<cuda::mr::device_accessible> upstream{tracker};
-  auto cache = std::make_shared<GpuEncodedCache>(resource, upstream);
+  auto cache = GpuInputCache::create(resource, upstream);
   for (int i = 0; i < 64; ++i) {
     ASSERT_TRUE(cache->getOrFill(std::to_string(i), kGiB, nullptr, [](void* p) {
-      GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, kGiB));
+      GpuInputCache::check(cudaMemsetAsync(p, 0x5a, kGiB));
     }));
   }
   auto root = memory::memoryManager()->addCustomRootPool(
@@ -1356,7 +1349,7 @@ TEST_F(GpuInputCacheTest, fullDeviceCapacityIsShared) {
   auto* data = allocation.allocate_sync(32L * kGiB, alignof(std::max_align_t));
   const auto counts = tracker.get_bytes_counter();
   size_t currentFree = 0;
-  GpuEncodedCache::check(cudaMemGetInfo(&currentFree, &total));
+  GpuInputCache::check(cudaMemGetInfo(&currentFree, &total));
   std::cout << "GPU_CACHE_CAPACITY live=" << counts.value
             << " peak=" << counts.peak
             << " device_used_delta=" << initialFree - currentFree

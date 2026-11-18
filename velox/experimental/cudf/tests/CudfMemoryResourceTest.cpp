@@ -16,7 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfMemoryResource.h"
-#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCache.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
@@ -188,13 +188,12 @@ void exercisePhysicalCacheRecovery(
     bool allPinned) {
   setCudfContextDevice(0);
   auto owner = createCudfCustomMemoryResource(256L << 20, enabled);
-  auto cache =
-      std::make_shared<GpuEncodedCache>(owner, createMemoryResource("cuda", 0));
-  std::vector<GpuEncodedCache::LeasePtr> pins;
+  auto cache = GpuInputCache::create(owner, createMemoryResource("cuda", 0));
+  std::vector<GpuInputCache::LeasePtr> pins;
   for (int i = 0; i < 8; ++i) {
     auto lease =
         cache->getOrFill(std::to_string(i), 8L << 20, nullptr, [](void* p) {
-          GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
+          GpuInputCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
         });
     ASSERT_TRUE(lease);
     if (allPinned || i == 0)
@@ -241,7 +240,7 @@ void exercisePhysicalCacheRecovery(
   EXPECT_EQ(leaf->usedBytes(), 0);
   EXPECT_EQ(state->liveBytes.load(), 0);
   unsigned char value = 0;
-  GpuEncodedCache::check(
+  GpuInputCache::check(
       cudaMemcpy(&value, pins.front()->data(), 1, cudaMemcpyDeviceToHost));
   EXPECT_EQ(value, 0x5a);
   pins.clear();
@@ -345,12 +344,11 @@ TEST_F(CudfMemoryResourceTest, ShardedPhysicalRetryWithZeroCapacityCredit) {
         return base->newReclaimer(ctx);
       },
       256L << 20);
-  auto cache =
-      std::make_shared<GpuEncodedCache>(owner, createMemoryResource("cuda", 0));
+  auto cache = GpuInputCache::create(owner, createMemoryResource("cuda", 0));
   for (int i = 0; i < 8; ++i)
     ASSERT_TRUE(
         cache->getOrFill(std::to_string(i), 8L << 20, nullptr, [](void* p) {
-          GpuEncodedCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
+          GpuInputCache::check(cudaMemsetAsync(p, 0x5a, 8L << 20));
         }));
   auto root =
       memory::memoryManager()->addCustomRootPool("zero-credit-demand", owner);

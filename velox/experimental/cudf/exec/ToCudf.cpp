@@ -20,8 +20,8 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
 #include "velox/experimental/cudf/exec/GpuCapabilities.h"
+#include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
@@ -416,14 +416,13 @@ void registerCudf() {
   }
 #endif
 
-  initializeEncodedInputGpuCache(
-      CudfConfig::getInstance().gpuInputCacheEnabled);
+  initializeGpuInputCache(CudfConfig::getInstance().gpuInputCacheEnabled);
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
   connector::hive::drainInputUploads();
-  resetEncodedInputGpuCache();
+  resetGpuInputCache();
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
   // Unconditionally unregister the UCX transports, whether or not
   // CudfConfig::exchange was set when registerCudf() ran.

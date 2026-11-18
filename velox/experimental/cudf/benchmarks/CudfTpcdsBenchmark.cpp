@@ -21,7 +21,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
-#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/tests/utils/CudfTpcdsQueryBuilder.h"
@@ -126,9 +126,9 @@ void CudfTpcdsBenchmark::initialize() {
           FLAGS_gpu_capacity_bytes, true);
       memory::CustomMemoryResourceRegistry::global().insert(
           std::string{cudf_velox::kCudfMemoryResourceTag}, resource);
-      deviceCache_ = std::make_shared<cudf_velox::GpuEncodedCache>(
+      deviceCache_ = cudf_velox::GpuInputCache::create(
           resource, *cudf_velox::mr_, FLAGS_gpu_cache_profile);
-      cudf_velox::setEncodedInputGpuCache(deviceCache_);
+      cudf_velox::setGpuInputCache(deviceCache_);
     }
     cudf_velox::registerCudfMemoryResource(FLAGS_gpu_capacity_bytes);
     queryExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(
@@ -175,7 +175,7 @@ CudfTpcdsBenchmark::makeConnectorProperties() {
 }
 
 void CudfTpcdsBenchmark::shutdown() {
-  cudf_velox::setEncodedInputGpuCache(nullptr);
+  cudf_velox::setGpuInputCache(nullptr);
   deviceCache_.reset();
   // CudfTpcdsQueryBuilder::shutdown() handles unregisterCudf().
   TpcdsBenchmark::shutdown();

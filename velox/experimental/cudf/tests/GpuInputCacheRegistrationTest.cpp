@@ -16,7 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
-#include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/caching/AsyncDataCache.h"
@@ -40,17 +40,17 @@ TEST(GpuInputCacheRegistrationTest, registrationUsesAccountedBackend) {
   CudfConfig::getInstance().initialize(
       {{CudfConfig::kGpuInputCacheEnabled, "false"}});
   registerCudf();
-  EXPECT_FALSE(encodedInputGpuCache());
+  EXPECT_FALSE(gpuInputCache());
   unregisterCudf();
   CudfConfig::getInstance().initialize(
       {{CudfConfig::kGpuInputCacheEnabled, "true"}});
   cache::AsyncDataCache::setInstance(nullptr);
   registerCudf();
-  EXPECT_FALSE(encodedInputGpuCache());
+  EXPECT_FALSE(gpuInputCache());
   unregisterCudf();
   cache::AsyncDataCache::setInstance(hostCache.get());
   registerCudf();
-  EXPECT_TRUE(encodedInputGpuCache());
+  EXPECT_TRUE(gpuInputCache());
   {
     auto query =
         core::QueryCtx::Builder().asyncDataCache(hostCache.get()).build();
@@ -60,7 +60,7 @@ TEST(GpuInputCacheRegistrationTest, registrationUsesAccountedBackend) {
         resource->arbitrator());
   }
   unregisterCudf();
-  EXPECT_FALSE(encodedInputGpuCache());
+  EXPECT_FALSE(gpuInputCache());
   cache::AsyncDataCache::setInstance(nullptr);
   hostCache->shutdown();
 }

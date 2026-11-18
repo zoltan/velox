@@ -13,20 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/cudf/exec/GpuEncodedCache.h"
+#include "velox/experimental/cudf/exec/GpuInputCache.h"
 
 #include "velox/common/memory/SharedArbitrator.h"
+#include "velox/exec/MemoryReclaimer.h"
 
 #include <folly/ScopeGuard.h>
 
 namespace facebook::velox::cudf_velox {
 
-GpuEncodedCache::Completion::~Completion() {
-  if (event)
-    cudaEventDestroy(event);
-}
-
-GpuEncodedCache::Lock::Lock(GpuEncodedCache& cache, Shard& shard)
+GpuInputCache::Lock::Lock(GpuInputCache& cache, Shard& shard)
     : cache_(cache), lock_(shard.mutex, std::defer_lock) {
   const auto start = cache_.profile_ ? now() : 0;
   lock_.lock();
@@ -36,27 +32,29 @@ GpuEncodedCache::Lock::Lock(GpuEncodedCache& cache, Shard& shard)
   }
 }
 
-GpuEncodedCache::Lock::~Lock() {
-  if (cache_.profile_)
+GpuInputCache::Lock::~Lock() {
+  if (cache_.profile_) {
     cache_.lockHoldNs_ += now() - acquired_;
+  }
 }
 
-bool GpuEncodedCache::Reclaimer::reclaimableBytes(
+bool GpuInputCache::Reclaimer::reclaimableBytes(
     const memory::MemoryPool&,
     uint64_t& bytes) const {
-  auto cache = cache_.load().lock();
+  auto cache = cache_.lock();
   bytes = cache ? cache->eligible_.load() : 0;
   return bytes != 0;
 }
 
-uint64_t GpuEncodedCache::Reclaimer::reclaim(
+uint64_t GpuInputCache::Reclaimer::reclaim(
     memory::MemoryPool*,
     uint64_t target,
     uint64_t,
     Stats& stats) {
-  auto cache = cache_.load().lock();
-  if (!cache)
+  auto cache = cache_.lock();
+  if (!cache) {
     return 0;
+  }
   const auto start = now();
   const auto freed = cache->evict(target);
   stats.reclaimedBytes += freed;
@@ -64,28 +62,29 @@ uint64_t GpuEncodedCache::Reclaimer::reclaim(
   return freed;
 }
 
-void GpuEncodedCache::Reclaimer::abort(
+void GpuInputCache::Reclaimer::abort(
     memory::MemoryPool*,
     const std::exception_ptr&) {
-  if (auto cache = cache_.load().lock()) {
+  if (auto cache = cache_.lock()) {
     cache->admissionDisabled_ = true;
     ++cache->aborts_;
-    cache->evict(0);
+    if (cache->initialized_.load()) {
+      cache->evict(0);
+    }
   }
 }
 
-void GpuEncodedCache::Lease::prepareCompletion() {
+void GpuInputCache::Lease::prepareCompletion() {
   completion_.emplace_back();
-  check(cudaEventCreateWithFlags(
-      &completion_.front().event, cudaEventDisableTiming));
 }
 
-GpuEncodedCache::Lease::~Lease() {
-  if (entry_)
+GpuInputCache::Lease::~Lease() {
+  if (entry_) {
     owner_->release(entry_, stream_, completion_);
+  }
 }
 
-void GpuEncodedCache::Lease::waitForFill() {
+void GpuInputCache::Lease::waitForFill() {
   auto& shard = owner_->shardFor(entry_->key);
   {
     std::lock_guard lock(shard.mutex);
@@ -102,7 +101,7 @@ void GpuEncodedCache::Lease::waitForFill() {
   VELOX_CHECK(entry_->state == State::Ready, "Cached input fill failed");
 }
 
-void GpuEncodedCache::Lease::completeFill() {
+void GpuInputCache::Lease::completeFill() {
   ensureCudaContextForThread();
   check(cudaEventRecord(entry_->ready, stream_));
   auto& shard = owner_->shardFor(entry_->key);
@@ -115,7 +114,7 @@ void GpuEncodedCache::Lease::completeFill() {
   entry_->filled.notify_all();
 }
 
-void GpuEncodedCache::Lease::failFill() {
+void GpuInputCache::Lease::failFill() {
   ensureCudaContextForThread();
   {
     auto& shard = owner_->shardFor(entry_->key);
@@ -128,7 +127,7 @@ void GpuEncodedCache::Lease::failFill() {
   if (cudaStreamSynchronize(stream_) != cudaSuccess) {
     std::terminate();
   }
-  owner_->reporting_->deallocate(
+  owner_->memory_->reporting->deallocate(
       cuda::stream_ref{stream_},
       entry_->data,
       entry_->bytes,
@@ -147,47 +146,83 @@ void GpuEncodedCache::Lease::failFill() {
   entry_->filled.notify_all();
 }
 
-void GpuEncodedCache::Lease::waitForFillOn(cudaStream_t stream) {
+void GpuInputCache::Lease::waitForFillOn(cudaStream_t stream) {
   check(cudaStreamWaitEvent(stream, entry_->ready, 0));
   stream_ = stream;
 }
 
-void GpuEncodedCache::Lease::handoffTo(cudaStream_t stream) {
+void GpuInputCache::Lease::handoffTo(cudaStream_t stream) {
   Completion completion;
-  check(cudaEventCreateWithFlags(&completion.event, cudaEventDisableTiming));
+
   check(cudaEventRecord(completion.event, stream_));
   check(cudaStreamWaitEvent(stream, completion.event, 0));
   stream_ = stream;
 }
 
-GpuEncodedCache::GpuEncodedCache(
+std::shared_ptr<GpuInputCache> GpuInputCache::create(
     std::shared_ptr<memory::CustomMemoryResource> resource,
     cuda::mr::any_resource<cuda::mr::device_accessible> upstream,
+    bool profile) {
+  auto cache = std::shared_ptr<GpuInputCache>(
+      new GpuInputCache(std::move(resource), profile));
+  cache->initialize(std::move(upstream));
+  return cache;
+}
+
+GpuInputCache::GpuInputCache(
+    std::shared_ptr<memory::CustomMemoryResource> resource,
     bool profile)
-    : resource_(std::move(resource)), profile_(profile) {
-  root_ = memory::memoryManager()->addCustomRootPool(
-      "gpu-encoded-cache",
-      resource_->allocator(),
-      resource_->arbitrator(),
-      resource_->maxCapacity(),
-      std::make_unique<Reclaimer>());
-  // Suspension is invoked on the requesting leaf, not the discardable root.
-  // Reuse normal Velox driver hooks for fills issued from reader operators.
-  leaf_ =
-      root_->addLeafChild("payloads", true, exec::MemoryReclaimer::create());
-  reporting_.emplace(std::move(upstream), leaf_);
+    : memory_(std::make_unique<Memory>()),
+      arbitrator_(
+          dynamic_cast<memory::SharedArbitrator*>(resource->arbitrator())),
+      profile_(profile) {
+  memory_->resource = std::move(resource);
+}
+
+void GpuInputCache::initialize(
+    cuda::mr::any_resource<cuda::mr::device_accessible> upstream) {
   ensureCudaContextForThread();
   check(cudaStreamCreateWithFlags(&freeStream_, cudaStreamNonBlocking));
+  // Bind the weak owner before publishing the root to arbitration callbacks.
+  memory_->root = memory::memoryManager()->addCustomRootPool(
+      "gpu-input-cache",
+      memory_->resource->allocator(),
+      memory_->resource->arbitrator(),
+      memory_->resource->maxCapacity(),
+      std::make_unique<Reclaimer>(weak_from_this()));
+  memory_->leaf = memory_->root->addLeafChild(
+      "payloads", true, exec::MemoryReclaimer::create());
+  memory_->reporting.emplace(std::move(upstream), memory_->leaf);
+  initialized_.store(true);
 }
 
-GpuEncodedCache::~GpuEncodedCache() {
-  // A lease retains this owner, so no leased entry can remain at destruction.
-  evict(0);
-  VELOX_CHECK_EQ(leaf_->usedBytes(), 0);
-  cudaStreamDestroy(freeStream_);
+GpuInputCache::~GpuInputCache() noexcept {
+  // Leases retain this owner. Failed construction has never admitted payloads.
+  if (initialized_.load()) {
+    try {
+      evict(0);
+      VELOX_CHECK_EQ(memory_->leaf->usedBytes(), 0);
+    } catch (const std::exception& error) {
+      LOG(ERROR)
+          << "Retaining GPU input cache allocations after failed teardown: "
+          << error.what();
+      // Completion is unknown. Preserve the upstream allocator AND accounting
+      // hierarchy, so pool teardown cannot free or reject the outstanding
+      // bytes.
+      memory_.release();
+      return;
+    } catch (...) {
+      LOG(ERROR) << "Retaining GPU input cache after unknown teardown failure";
+      memory_.release();
+      return;
+    }
+  }
+  if (freeStream_) {
+    cudaStreamDestroy(freeStream_);
+  }
 }
 
-GpuEncodedCache::LeasePtr GpuEncodedCache::getOrFill(
+GpuInputCache::LeasePtr GpuInputCache::getOrFill(
     const std::string& key,
     uint64_t bytes,
     cudaStream_t stream,
@@ -196,7 +231,7 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::getOrFill(
   return access(key, bytes, stream, &fill, std::move(sourceIdentity));
 }
 
-GpuEncodedCache::LeasePtr GpuEncodedCache::reserve(
+GpuInputCache::LeasePtr GpuInputCache::reserve(
     const std::string& key,
     uint64_t bytes,
     cudaStream_t stream,
@@ -208,7 +243,7 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::reserve(
       key, bytes, stream, &deferredFill, std::move(sourceIdentity), &needsFill);
 }
 
-uint64_t GpuEncodedCache::evict(uint64_t target) {
+uint64_t GpuInputCache::evict(uint64_t target) {
   const auto start = now();
   ensureCudaContextForThread();
   ++calls_;
@@ -240,16 +275,18 @@ uint64_t GpuEncodedCache::evict(uint64_t target) {
       // A failed acquisition may roll its pin back before a stream wait on
       // readiness was installed. Such an entry still owns a pending fill.
       const auto ready = cudaEventQuery(entry->ready);
-      if (ready == cudaErrorNotReady)
+      if (ready == cudaErrorNotReady) {
         check(cudaEventSynchronize(entry->ready));
-      else
+      } else {
         check(ready);
+      }
       for (const auto& completion : entry->consumers) {
         const auto status = cudaEventQuery(completion.event);
-        if (status == cudaErrorNotReady)
+        if (status == cudaErrorNotReady) {
           check(cudaEventSynchronize(completion.event));
-        else
+        } else {
           check(status);
+        }
       }
     }
     eventWaitNs_ += now() - waitStart;
@@ -260,7 +297,7 @@ uint64_t GpuEncodedCache::evict(uint64_t target) {
       std::lock_guard lock(freeMutex_);
       while (!victims.empty()) {
         const auto& entry = victims.front();
-        reporting_->deallocate(
+        memory_->reporting->deallocate(
             cuda::stream_ref{freeStream_},
             entry->data,
             entry->bytes,
@@ -278,7 +315,7 @@ uint64_t GpuEncodedCache::evict(uint64_t target) {
         }
         victims.pop_front();
       }
-      leaf_->release();
+      memory_->leaf->release();
     }
     freeNs_ += now() - freeStart;
   } catch (...) {
@@ -297,8 +334,8 @@ uint64_t GpuEncodedCache::evict(uint64_t target) {
   return bytes;
 }
 
-folly::dynamic GpuEncodedCache::snapshot() const {
-  return folly::dynamic::object("live_bytes", leaf_->usedBytes())(
+folly::dynamic GpuInputCache::snapshot() const {
+  return folly::dynamic::object("live_bytes", memory_->leaf->usedBytes())(
       "eligible_bytes", eligible_.load())(
       "pending_free_bytes", pendingFree_.load())("hits", hits_.load())(
       "misses", misses_.load())("coalesced_fills", coalesced_.load())(
@@ -313,19 +350,15 @@ folly::dynamic GpuEncodedCache::snapshot() const {
       "reclaim_ns", reclaimNs_.load())("cache_aborts", aborts_.load());
 }
 
-GpuEncodedCache::LeasePtr GpuEncodedCache::access(
+GpuInputCache::LeasePtr GpuInputCache::access(
     const std::string& key,
     uint64_t bytes,
     cudaStream_t stream,
     const std::function<void(void*)>* fill,
     std::shared_ptr<const void> sourceIdentity,
     bool* needsFill) {
-  std::call_once(bindOnce_, [&] {
-    static_cast<Reclaimer*>(root_->reclaimer())->bind(weak_from_this());
-  });
   ensureCudaContextForThread();
-  auto* arbitrator =
-      dynamic_cast<memory::SharedArbitrator*>(resource_->arbitrator());
+  auto* arbitrator = arbitrator_;
   Lease lease(shared_from_this(), stream);
   auto& shard = shardFor(key);
   std::shared_ptr<Entry> entry;
@@ -336,21 +369,24 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
     const auto beforeLock = profile_ ? now() : 0;
     std::unique_lock lock(shard.mutex);
     const auto acquired = profile_ ? now() : 0;
-    if (profile_)
+    if (profile_) {
       lockWaitNs_ += acquired - beforeLock;
+    }
     auto it = shard.entries.find(key);
     if (it == shard.entries.end()) {
       if (!fill) {
-        if (profile_)
+        if (profile_) {
           lockHoldNs_ += now() - acquired;
+        }
         return nullptr;
       }
       if (admissionDisabled_.load() ||
           (arbitrator && !arbitrator->canAdmitDiscardable()) ||
           now() < admitAfterNs_.load()) {
         ++bypasses_;
-        if (profile_)
+        if (profile_) {
           lockHoldNs_ += now() - acquired;
+        }
         return nullptr;
       }
       VELOX_CHECK_GT(bytes, 0);
@@ -374,8 +410,9 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
       // freed the entry or restored it after a failed completion wait.
       if (entry->state == State::Evicting ||
           (needsFill && entry->state == State::Filling)) {
-        if (fill)
+        if (fill) {
           ++bypasses_;
+        }
         return nullptr;
       }
       VELOX_CHECK(
@@ -388,8 +425,9 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
       ++hits_;
       if (entry->state == State::Filling) {
         ++coalesced_;
-        if (profile_)
+        if (profile_) {
           lockHoldNs_ += now() - acquired;
+        }
         lock.unlock();
         // A creator can be suspended by allocation arbitration. Its task must
         // be able to pause while another driver waits for that same fill.
@@ -417,15 +455,16 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
         return std::make_shared<Lease>(std::move(lease));
       }
     }
-    if (profile_)
+    if (profile_) {
       lockHoldNs_ += now() - acquired;
+    }
   }
   if (creator) {
     try {
       lease.prepareCompletion();
       for (unsigned attempt = 0;; ++attempt) {
         try {
-          entry->data = reporting_->allocate(
+          entry->data = memory_->reporting->allocate(
               cuda::stream_ref{stream}, bytes, alignof(std::max_align_t));
           break;
         } catch (...) {
@@ -457,14 +496,15 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
       // A partially submitted fill may still touch its destination.
       if (entry->data) {
         cudaStreamSynchronize(stream);
-        reporting_->deallocate(
+        memory_->reporting->deallocate(
             cuda::stream_ref{stream},
             entry->data,
             bytes,
             alignof(std::max_align_t));
       }
-      if (entry->ready)
+      if (entry->ready) {
         cudaEventDestroy(entry->ready);
+      }
       {
         Lock lock(*this, shard);
         entry->state = State::Failed;
@@ -496,10 +536,12 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
         ++bypasses_;
         ++admissionFailures_;
         admitAfterNs_ = now() + 1'000'000;
-      } else
+      } else {
         ++fillErrors_;
-      if (submitted)
+      }
+      if (submitted) {
         throw; // Do not turn a failed payload write into a cache miss.
+      }
       return nullptr;
     }
     {
@@ -529,7 +571,7 @@ GpuEncodedCache::LeasePtr GpuEncodedCache::access(
   }
 }
 
-void GpuEncodedCache::release(
+void GpuInputCache::release(
     const std::shared_ptr<Entry>& entry,
     cudaStream_t stream,
     Completions& completion) noexcept {
@@ -540,8 +582,9 @@ void GpuEncodedCache::release(
     // event even though the consumer stream is healthy.
     // Synchronize only this exceptional path before dropping its protection.
     // A failed synchronization means GPU completion cannot be established.
-    if (cudaStreamSynchronize(stream) != cudaSuccess)
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
       std::terminate();
+    }
     completion.clear();
   }
   auto& shard = shardFor(entry->key);
@@ -553,10 +596,11 @@ void GpuEncodedCache::release(
   // Our pin protects temporarily detached completion nodes. No allocations
   // are needed, and an unqueryable event stays protected for reclamation.
   for (auto it = previous.begin(); it != previous.end();) {
-    if (cudaEventQuery(it->event) == cudaSuccess)
+    if (cudaEventQuery(it->event) == cudaSuccess) {
       it = previous.erase(it);
-    else
+    } else {
       ++it;
+    }
   }
   {
     Lock lock(*this, shard);

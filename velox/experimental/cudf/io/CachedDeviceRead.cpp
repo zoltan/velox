@@ -17,14 +17,14 @@
 
 namespace facebook::velox::cudf_velox {
 CachedDeviceRead readCachedDeviceRange(
-    const std::shared_ptr<GpuEncodedCache>& cache,
+    const std::shared_ptr<GpuInputCache>& cache,
     const std::string& key,
     uint64_t bytes,
     uint64_t padding,
     cuda::stream_ref producer,
     const std::function<void(void*)>& fill,
     std::shared_ptr<const void> identity,
-    GpuEncodedCache::LeasePtr lease) {
+    GpuInputCache::LeasePtr lease) {
   VELOX_CHECK_LE(padding, std::numeric_limits<uint64_t>::max() - bytes);
   bool filled = false;
   if (!lease && cache) {
