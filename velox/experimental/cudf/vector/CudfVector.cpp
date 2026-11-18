@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudaEventPool.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -33,6 +34,8 @@
 #include <cuda_runtime_api.h>
 
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -43,17 +46,16 @@ cudaError_t joinStreams(cuda::stream_ref source, cuda::stream_ref destination) {
   if (source.get() == destination.get()) {
     return cudaSuccess;
   }
-  cudaEvent_t event;
-  auto status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-  if (status != cudaSuccess) {
+  try {
+    PooledCudaEvent event;
+    auto status = cudaEventRecord(event.get(), source.get());
+    if (status == cudaSuccess) {
+      status = cudaStreamWaitEvent(destination.get(), event.get(), 0);
+    }
     return status;
+  } catch (...) {
+    return cudaErrorUnknown;
   }
-  status = cudaEventRecord(event, source.get());
-  if (status == cudaSuccess) {
-    status = cudaStreamWaitEvent(destination.get(), event, 0);
-  }
-  const auto destroyStatus = cudaEventDestroy(event);
-  return status == cudaSuccess ? destroyStatus : status;
 }
 
 // Reuse a stream per publication thread without putting consumer waits on a
@@ -104,12 +106,30 @@ struct CudfVector::SharedStorage {
   std::shared_ptr<rmm::cuda_stream> releaseStream{reclamationStream()};
   TableStorage table;
   std::atomic<bool> unsafeToFree{false};
+  std::mutex mutex;
+  std::vector<PooledCudaEvent> readers;
+
+  void recordReader(cuda::stream_ref reader) {
+    PooledCudaEvent event;
+    CUDF_CUDA_TRY(cudaEventRecord(event.get(), reader.get()));
+    std::lock_guard lock(mutex);
+    readers.push_back(std::move(event));
+  }
 
   cuda::stream_ref stream() const {
     return *releaseStream;
   }
 
   ~SharedStorage() {
+    // Last owner: no reader can append another event. Defer cross-stream
+    // waits until here so releasing one reader does not burden the producer.
+    for (auto& event : readers) {
+      const auto status = cudaStreamWaitEvent(stream().get(), event.get(), 0);
+      if (status != cudaSuccess &&
+          cudaEventSynchronize(event.get()) != cudaSuccess) {
+        unsafeToFree.store(true);
+      }
+    }
     if (unsafeToFree.load()) {
       // A failed CUDA context cannot prove that readers have stopped using
       // storage. Keep the allocations alive rather than aborting in teardown
@@ -127,12 +147,13 @@ void CudfVector::releaseShared() noexcept {
   if (!sharedStorage_) {
     return;
   }
-  const auto status = joinStreams(stream_, sharedStorage_->stream());
-  if (status != cudaSuccess) {
+  try {
+    sharedStorage_->recordReader(stream_);
+  } catch (const std::exception& error) {
     // Destruction cannot throw. Keep buffers alive until the outstanding use
     // completes if event creation/recording fails (e.g. during cancellation).
     LOG(ERROR) << "Cannot order shared device storage release: "
-               << cudaGetErrorString(status);
+               << error.what();
     const auto waitStatus = cudaStreamSynchronize(stream_.get());
     if (waitStatus != cudaSuccess) {
       LOG(ERROR) << "Retaining shared storage after failed CUDA completion: "
