@@ -343,14 +343,34 @@ TEST_F(CudfCteTest, matchingDomainConversionIsZeroCopy) {
       conversion = std::move(op);
     }
     conversion->initialize();
-    conversion->addInput(input);
-    EXPECT_FALSE(conversion->needsInput());
-    EXPECT_EQ(conversion->getOutput().get(), input.get());
+    const int iterations = std::getenv("VELOX_CTE_CONVERSION_ITERATIONS")
+        ? std::max(1, std::atoi(std::getenv("VELOX_CTE_CONVERSION_ITERATIONS")))
+        : 2;
+    bool same = true;
+    const auto begin = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+      conversion->addInput(input);
+      same &= !conversion->needsInput();
+      same &= conversion->getOutput().get() == input.get();
+    }
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
+            .count();
+    EXPECT_TRUE(same);
+    std::cout << "CTE_CONVERSION gpu=" << gpu << " iterations=" << iterations
+              << " seconds=" << seconds << std::endl;
     EXPECT_EQ(cudfAllocatedBytes(), bytes);
     conversion->noMoreInput();
     EXPECT_EQ(conversion->getOutput(), nullptr);
     EXPECT_TRUE(conversion->isFinished());
     conversion->close();
+    EXPECT_EQ(
+        conversion->stats().rlock()->runtimeStats.at("matchingInputRows").sum,
+        iterations * input->size());
+    conversion->close();
+    EXPECT_EQ(
+        conversion->stats().rlock()->runtimeStats.at("matchingInputRows").sum,
+        iterations * input->size());
   }
 }
 

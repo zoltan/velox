@@ -69,6 +69,7 @@ class CudfFromVelox : public CudfOperatorBase {
   std::size_t currentOutputSize_ = 0;
   // CTE producers retain their input domain; each reader normalizes locally.
   bool allowMatchingInput_{false};
+  uint64_t matchingInputRows_{0};
   RowVectorPtr matchingInput_;
   bool finished_ = false;
 };
@@ -120,6 +121,7 @@ class CudfToVelox : public CudfOperatorBase {
   vector_size_t veloxOffset_{0};
   // CTE producers retain their input domain; each reader normalizes locally.
   bool allowMatchingInput_{false};
+  uint64_t matchingInputRows_{0};
   RowVectorPtr matchingInput_;
   bool finished_ = false;
 };

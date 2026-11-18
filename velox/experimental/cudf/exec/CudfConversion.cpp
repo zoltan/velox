@@ -102,7 +102,7 @@ CudfFromVelox::CudfFromVelox(
 void CudfFromVelox::doAddInput(RowVectorPtr input) {
   if (allowMatchingInput_ && dynamic_cast<const CudfVector*>(input.get())) {
     VELOX_CHECK(needsInput());
-    addRuntimeStat("matchingInputRows", RuntimeCounter(input->size()));
+    matchingInputRows_ += input->size();
     matchingInput_ = std::move(input);
     return;
   }
@@ -208,6 +208,9 @@ RowVectorPtr CudfFromVelox::doGetOutput() {
 }
 
 void CudfFromVelox::doClose() {
+  if (const auto rows = std::exchange(matchingInputRows_, 0)) {
+    addRuntimeStat("matchingInputRows", RuntimeCounter(rows));
+  }
   // TODO(kn): Remove default stream after redesign of CudfFromVelox
   cudf::get_default_stream(cudf::allow_default_stream).sync();
   Operator::close();
@@ -249,7 +252,7 @@ bool CudfToVelox::isPassthroughMode() const {
 void CudfToVelox::doAddInput(RowVectorPtr input) {
   if (allowMatchingInput_ && !dynamic_cast<const CudfVector*>(input.get())) {
     VELOX_CHECK(needsInput());
-    addRuntimeStat("matchingInputRows", RuntimeCounter(input->size()));
+    matchingInputRows_ += input->size();
     matchingInput_ = std::move(input);
     return;
   }
@@ -414,6 +417,9 @@ RowVectorPtr CudfToVelox::doGetOutput() {
 }
 
 void CudfToVelox::doClose() {
+  if (const auto rows = std::exchange(matchingInputRows_, 0)) {
+    addRuntimeStat("matchingInputRows", RuntimeCounter(rows));
+  }
   Operator::close();
   inputs_.clear();
   matchingInput_.reset();
