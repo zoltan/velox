@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
+#include "velox/experimental/cudf/connectors/hive/ScopedReadSuspension.h"
 #include "velox/experimental/cudf/exec/CachedDeviceRead.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 
@@ -407,6 +408,7 @@ gpu::DeviceReadBatch BufferedInputDataSource::readCachedRanges(
         return;
       }
       finished = true;
+      ScopedReadSuspension suspension;
       // Drain every accepted read before releasing any destination, preserving
       // the first failure even if a later read also fails.
       for (size_t i = 0; i < pending.size(); ++i) {

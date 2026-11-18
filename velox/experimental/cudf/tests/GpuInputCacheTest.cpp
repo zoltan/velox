@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
 #include "velox/experimental/cudf/exec/CachedDeviceRead.h"
 #include "velox/experimental/cudf/exec/GpuInputCache.h"
 #include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
@@ -536,6 +537,157 @@ TEST_F(GpuInputCacheTest, hostStagingIsAccountedUntilBufferRelease) {
   EXPECT_GE(pool->usedBytes(), baseline + 8192);
   buffer.reset();
   EXPECT_EQ(pool->usedBytes(), baseline);
+}
+
+// Reclaim the reading query from an I/O thread, while its driver waits for the
+// read. A bounded pause makes the old circular wait fail without a long hang.
+TEST_F(GpuInputCacheTest, stagingArbitrationCanPauseReadingDriver) {
+  for (bool cached : {false, true}) {
+    for (int completion : {0, 1, 2}) {
+      SCOPED_TRACE(cached);
+      SCOPED_TRACE(completion);
+      auto resource = createCudfCustomMemoryResource(128L << 20, true);
+      auto cache =
+          GpuInputCache::create(resource, createMemoryResource("cuda", 0));
+      setGpuInputCache(cached ? cache : nullptr);
+      SCOPE_EXIT {
+        setGpuInputCache(nullptr);
+      };
+      StringIdMap ids;
+      auto identity =
+          std::make_shared<StringIdLease>(ids, "staging-arbitration-input");
+      constexpr uint64_t kHeld = 24ULL << 20;
+      constexpr uint64_t kRead = 16ULL << 20;
+      struct State {
+        std::weak_ptr<exec::Task> task;
+        memory::MemoryPool* pool{nullptr};
+        void* held{nullptr};
+        int calls{0};
+      } state;
+      class Reclaimer final : public exec::MemoryReclaimer {
+       public:
+        explicit Reclaimer(State& state)
+            : exec::MemoryReclaimer(0), state_(state) {}
+        bool reclaimableBytes(const memory::MemoryPool&, uint64_t& bytes)
+            const override {
+          bytes = state_.held ? kHeld : 0;
+          return true;
+        }
+        uint64_t reclaim(
+            memory::MemoryPool*,
+            uint64_t,
+            uint64_t,
+            memory::MemoryReclaimer::Stats& stats) override {
+          ++state_.calls;
+          auto task = state_.task.lock();
+          VELOX_CHECK_NOT_NULL(task);
+          auto paused = task->requestPause();
+          SCOPE_EXIT {
+            exec::Task::resume(task);
+          };
+          VELOX_CHECK(
+              std::move(paused).wait(std::chrono::seconds(1)),
+              "Reading driver prevented staging arbitration");
+          if (!state_.held) {
+            return 0;
+          }
+          state_.pool->free(std::exchange(state_.held, nullptr), kHeld);
+          stats.reclaimedBytes += kHeld;
+          return kHeld;
+        }
+
+       private:
+        State& state_;
+      };
+      memory::MemoryArbitrator::Config config;
+      config.kind = "SHARED";
+      config.capacity = 32ULL << 20;
+      config.extraConfigs = {
+          {"memory-pool-initial-capacity", "0B"},
+          {"memory-pool-reserved-capacity", "0B"},
+          {"fast-exponential-growth-capacity-limit", "0B"},
+          {"slow-capacity-grow-pct", "0"},
+          {"memory-pool-min-free-capacity", "0B"},
+          {"memory-pool-min-free-capacity-pct", "0"},
+          {"memory-pool-min-reclaim-bytes", "0B"},
+          {"memory-pool-min-reclaim-pct", "0"},
+          {"max-memory-arbitration-time", "3s"}};
+      auto arbitrator = std::make_unique<memory::SharedArbitrator>(config);
+      auto root = memory::memoryManager()->addCustomRootPool(
+          "staging-arbitration",
+          memory::memoryManager()->allocator(),
+          arbitrator.get(),
+          config.capacity,
+          std::make_unique<Reclaimer>(state));
+      auto heldPool = root->addLeafChild("reclaimable");
+      state.pool = heldPool.get();
+      state.held = heldPool->allocate(kHeld);
+      SCOPE_EXIT {
+        if (state.held) {
+          heldPool->free(state.held, kHeld);
+        }
+      };
+      auto pool = root->addLeafChild("read");
+      auto values = std::make_shared<RowVector>(
+          pool.get(), ROW({}), nullptr, 1, std::vector<VectorPtr>{});
+      auto plan = std::make_shared<core::ValuesNode>(
+          "values", std::vector<RowVectorPtr>{values});
+      folly::CPUThreadPoolExecutor executor(2);
+      auto task = exec::Task::create(
+          "staging-arbitration",
+          core::PlanFragment{plan},
+          0,
+          core::QueryCtx::create(
+              &executor, core::QueryConfig{{}}, {}, nullptr, root),
+          exec::Task::ExecutionMode::kParallel);
+      state.task = task;
+      auto input = std::make_shared<CacheableInput>(
+          std::make_shared<InMemoryReadFile>(std::string(kRead, 'x')),
+          *pool,
+          cached,
+          &executor);
+      auto source =
+          std::make_shared<RecordingInputSource>(input, nullptr, identity);
+      folly::Baton<> submitted;
+      source->beforeRead = [&] { submitted.wait(); };
+      auto driver = exec::Driver::testingCreate(
+          std::make_unique<exec::DriverCtx>(task, 0, 0, 0, 0));
+      driver->state().isEnqueued = true;
+      ASSERT_EQ(task->enter(driver->state()), exec::StopReason::kNone);
+      SCOPE_EXIT {
+        task->leave(driver->state(), [](exec::StopReason) {});
+      };
+      exec::ScopedDriverThreadContext context(driver->driverCtx());
+      rmm::cuda_stream stream;
+      auto mr = createMemoryResource("cuda", 0);
+      const std::vector<cudf::io::text::byte_range_info> ranges{{0, kRead}};
+      {
+        auto fetch = connector::hive::fetchByteRangesAsync(
+            source, ranges, false, stream, cudf::memory_resources{mr, mr});
+        if (completion == 2) {
+          task->requestCancel();
+        }
+        submitted.post();
+        if (completion == 0) {
+          ASSERT_NO_THROW(fetch.waitOn(stream));
+          uint8_t value = 0;
+          GpuInputCache::check(cudaMemcpyAsync(
+              &value,
+              fetch.data[0].data(),
+              1,
+              cudaMemcpyDeviceToHost,
+              stream.value()));
+          stream.synchronize();
+          EXPECT_EQ(value, 'x');
+        }
+      }
+      EXPECT_GE(state.calls, 1);
+      EXPECT_EQ(state.held, nullptr);
+      stream.synchronize();
+      connector::hive::drainInputUploads();
+      EXPECT_EQ(pool->usedBytes(), 0);
+    }
+  }
 }
 
 TEST_F(GpuInputCacheTest, coldReadsReturnPendingAndCoalesceMisses) {

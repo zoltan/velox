@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
+#include "velox/experimental/cudf/connectors/hive/ScopedReadSuspension.h"
 
 #include "velox/common/base/Exceptions.h"
 
@@ -61,6 +62,7 @@ ByteRangeFetch fetchByteRangesAsync(
     bool serializeSubmissions,
     cuda::stream_ref stream,
     cudf::memory_resources mr) {
+  ScopedReadSuspension suspension;
   auto* source = dynamic_cast<gpu::DeviceReadSource*>(dataSource.get());
   if (source == nullptr) {
     return copyByteRangesAsync(
@@ -114,11 +116,19 @@ ByteRangeFetch copyByteRangesAsync(
     bool serializeSubmissions,
     cuda::stream_ref stream,
     cudf::memory_resources mr) {
+  ScopedReadSuspension suspension;
   // Allocate the owner before starting I/O so host allocation failure cannot
   // release buffers while reads are still pending.
   struct Owner {
     std::shared_ptr<cudf::io::datasource> source;
     std::vector<rmm::device_buffer> buffers;
+    std::future<void> pending;
+    ~Owner() {
+      if (pending.valid()) {
+        ScopedReadSuspension suspension;
+        pending.wait();
+      }
+    }
   };
   auto owner = std::make_shared<Owner>();
   owner->source = std::move(dataSource);
@@ -134,8 +144,14 @@ ByteRangeFetch copyByteRangesAsync(
           mr);
   ByteRangeFetch result;
   result.owner = owner;
-  result.pending = std::move(pending);
   owner->buffers = std::move(buffers);
+  owner->pending = std::move(pending);
+  if (owner->pending.valid()) {
+    result.pending = std::async(std::launch::deferred, [owner] {
+      ScopedReadSuspension suspension;
+      owner->pending.get();
+    });
+  }
   result.data.reserve(data.size());
   for (const auto& view : data) {
     result.data.emplace_back(view.data(), view.size());

@@ -139,7 +139,8 @@ below cuDF readers and operators, not below all of Velox execution.
 ### Host upload storage
 
 The OSS datasource accounts contiguous staging buffers through BufferedInput's
-external-allocation API and retains that pool with each buffer. The existing
+external-allocation API and retains that pool with each buffer. CPU staging
+counts toward the query's CPU memory limit, independently of GPU caching. The existing
 vector allocation path is preserved. Both pinned buffers supplied
 by another datasource and these pageable buffers remain alive until the recorded
 copy event completes. CUDA's asynchronous pageable-copy contract does not promise
@@ -151,3 +152,30 @@ CUDA 12.8 introduces `cudaMemcpyBatchAsync` with
 RTX PRO 6000/CUDA 13 experiment found explicit source completion slower for
 1 MiB and 16 MiB transfers, so the production path retains event-based completion.
 This also preserves asynchronous copies from internal pinned host caches.
+
+### Staging arbitration and read completion
+
+An OSS staging allocation can enter CPU arbitration from an IO executor thread.
+A driver draining that read must acknowledge task pause; otherwise reclaiming
+its own query waits for a driver that is waiting for the allocation. cuDF read
+submission and completion now suspend the current driver around blocking work,
+including failed submissions, destruction of abandoned batches, and cancellation.
+No driver context means no suspension. Nested scopes reuse the outer suspension.
+
+Task suspension has an explicit cleanup option for already-terminated drivers.
+It updates the running-thread count while mandatory asynchronous cleanup drains,
+then restores the count when the driver leaves suspension. Ordinary suspension
+still reports termination. Tests cover the old termination behavior and a pause
+that completes only after the cleanup suspension acknowledges it.
+
+This avoids reserving all requested ranges before submitting a batch: warm hits
+need no staging, and internal host_read overrides may return already-accounted
+pinned buffers. Actual OSS staging remains charged to the query pool, and its
+CPU limit can reject a request. Retaining the prior untracked-allocation behavior
+would hide memory, rather than preserve a valid memory limit.
+
+The regression uses a 32 MiB arbitrator, a query holding 24 MiB, and a 16 MiB
+pending read. Its reclaimer pauses the reading task and releases the held bytes.
+It fails before suspension, and also exposes cancellation if cleanup suspension
+is omitted. Cached and uncached reads pass explicit wait, abandonment, and
+cancellation cases; staging charges return to zero after upload retirement.
