@@ -18,8 +18,8 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderByteFetch.h"
+#include "velox/experimental/cudf/exec/CachedDeviceRead.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/io/CachedDeviceRead.h"
 
 #include "velox/common/base/Exceptions.h"
 

@@ -15,7 +15,7 @@
  */
 
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
-#include "velox/experimental/cudf/io/CachedDeviceRead.h"
+#include "velox/experimental/cudf/exec/CachedDeviceRead.h"
 #include "velox/experimental/cudf/exec/GpuInputCache.h"
 #include "velox/experimental/cudf/exec/GpuInputCacheRegistry.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"

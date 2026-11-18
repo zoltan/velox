@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/cudf/io/CachedDeviceRead.h"
+#include "velox/experimental/cudf/exec/CachedDeviceRead.h"
 
 namespace facebook::velox::cudf_velox {
 CachedDeviceRead readCachedDeviceRange(

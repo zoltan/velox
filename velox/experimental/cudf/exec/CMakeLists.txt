@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Shared by readers and operators; keep cache ownership below both layers.
+# Shared by cuDF readers and operators. The velox_exec dependency supplies
+# driver suspension/resumption during memory arbitration.
 add_library(
   velox_cudf_memory
   CudfMemoryArbitration.cpp
@@ -20,7 +21,7 @@ add_library(
   GpuResources.cpp
   GpuInputCache.cpp
   GpuInputCacheRegistry.cpp
-  ../io/CachedDeviceRead.cpp
+  CachedDeviceRead.cpp
 )
 target_link_libraries(
   velox_cudf_memory
