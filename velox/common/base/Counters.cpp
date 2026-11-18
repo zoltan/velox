@@ -407,6 +407,13 @@ void registerVeloxMetrics() {
       kMetricArbitratorGlobalArbitrationCount,
       facebook::velox::StatType::COUNT);
 
+  DEFINE_METRIC(
+      kMetricDiscardableRecoveryCount, facebook::velox::StatType::COUNT);
+  DEFINE_METRIC(
+      kMetricDiscardableRecoveryTimeNs, facebook::velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricDiscardableRecoveryBytes, facebook::velox::StatType::SUM);
+
   // The number of victims distribution of a global arbitration run [0, 32] with
   // 32 buckets. It is configured to report the number of victims at P50, P90,
   // P99, and P100 percentiles.

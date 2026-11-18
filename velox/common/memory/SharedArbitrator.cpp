@@ -1199,9 +1199,13 @@ uint64_t SharedArbitrator::reclaimDiscardableMemory(
         candidate.participant->pool()->reclaimableBytes().value_or(0) > 0)
       *moreReclaimable = true;
   }
+  const auto elapsedNs = watch.elapsed().count();
   ++discardableRecoveryRequests_;
-  discardableRecoveryTimeNs_ += watch.elapsed().count();
+  discardableRecoveryTimeNs_ += elapsedNs;
   discardableRecoveryBytes_ += reclaimed;
+  RECORD_METRIC_VALUE(kMetricDiscardableRecoveryCount);
+  RECORD_METRIC_VALUE(kMetricDiscardableRecoveryTimeNs, elapsedNs);
+  RECORD_METRIC_VALUE(kMetricDiscardableRecoveryBytes, reclaimed);
   return reclaimed;
 }
 
