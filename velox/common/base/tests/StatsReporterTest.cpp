@@ -27,6 +27,7 @@
 #include "velox/common/caching/CacheTTLController.h"
 #include "velox/common/caching/SsdCache.h"
 #include "velox/common/memory/MmapAllocator.h"
+#include "velox/common/memory/SharedArbitrator.h"
 
 namespace facebook::velox::test {
 
@@ -98,6 +99,28 @@ class StatsReporterTest : public testing::Test {
     verifyDynamicQuantileRegistration(std::string(pattern), config);
   }
 };
+
+TEST_F(StatsReporterTest, discardableRecoveryUsesArbitratorMetrics) {
+  memory::MemoryArbitrator::Config config;
+  config.kind = "SHARED";
+  config.capacity = 32ULL << 20;
+  config.extraConfigs["bounded-discardable-reclaim"] = "true";
+  memory::SharedArbitrator arbitrator(config);
+  EXPECT_EQ(arbitrator.reclaimDiscardableMemory(1), 0);
+  const auto stats = arbitrator.discardableRecoveryStats();
+  EXPECT_EQ(stats.requests, 1);
+  EXPECT_EQ(
+      reporter_->counterMap.at("velox.arbitrator_discardable_recovery_count"),
+      1);
+  EXPECT_EQ(
+      reporter_->counterMap.at("velox.arbitrator_discardable_recovery_bytes"),
+      0);
+  EXPECT_EQ(
+      reporter_->counterMap.at("velox.arbitrator_discardable_recovery_time_ms"),
+      stats.timeNs / 1'000'000);
+  EXPECT_EQ(
+      reporter_->counterMap.count("velox.discardable_recovery_time_ns"), 0);
+}
 
 TEST_F(StatsReporterTest, trivialReporter) {
   DEFINE_METRIC("key1", StatType::COUNT);

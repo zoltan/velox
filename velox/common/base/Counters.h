@@ -87,12 +87,12 @@ constexpr std::string_view kMetricArbitratorLocalArbitrationCount{
     "velox.arbitrator_local_arbitration_count"};
 
 // Explicit discardable-cache recovery is separate from global arbitration.
-constexpr std::string_view kMetricDiscardableRecoveryCount{
-    "velox.discardable_recovery_count"};
-constexpr std::string_view kMetricDiscardableRecoveryTimeNs{
-    "velox.discardable_recovery_time_ns"};
-constexpr std::string_view kMetricDiscardableRecoveryBytes{
-    "velox.discardable_recovery_bytes"};
+constexpr std::string_view kMetricArbitratorDiscardableRecoveryCount{
+    "velox.arbitrator_discardable_recovery_count"};
+constexpr std::string_view kMetricArbitratorDiscardableRecoveryTimeMs{
+    "velox.arbitrator_discardable_recovery_time_ms"};
+constexpr std::string_view kMetricArbitratorDiscardableRecoveryBytes{
+    "velox.arbitrator_discardable_recovery_bytes"};
 
 constexpr std::string_view kMetricArbitratorGlobalArbitrationCount{
     "velox.arbitrator_global_arbitration_count"};

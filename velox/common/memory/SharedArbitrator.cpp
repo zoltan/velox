@@ -1203,9 +1203,10 @@ uint64_t SharedArbitrator::reclaimDiscardableMemory(
   ++discardableRecoveryRequests_;
   discardableRecoveryTimeNs_ += elapsedNs;
   discardableRecoveryBytes_ += reclaimed;
-  RECORD_METRIC_VALUE(kMetricDiscardableRecoveryCount);
-  RECORD_METRIC_VALUE(kMetricDiscardableRecoveryTimeNs, elapsedNs);
-  RECORD_METRIC_VALUE(kMetricDiscardableRecoveryBytes, reclaimed);
+  RECORD_METRIC_VALUE(kMetricArbitratorDiscardableRecoveryCount);
+  RECORD_METRIC_VALUE(
+      kMetricArbitratorDiscardableRecoveryTimeMs, elapsedNs / 1'000'000);
+  RECORD_METRIC_VALUE(kMetricArbitratorDiscardableRecoveryBytes, reclaimed);
   return reclaimed;
 }
 
