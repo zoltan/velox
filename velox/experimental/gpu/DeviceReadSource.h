@@ -124,7 +124,11 @@ class DeviceReadSource {
   /// have a non-null owner, including for an empty request. Providers satisfy
   /// the caller's decoder padding requirements and arrange release after queued
   /// consumption on the supplied stream. This capability does not imply
-  /// caching.
+  /// caching. serializeSubmissions requests contiguous submission of this read
+  /// batch relative to other callers using the same scheduling domain. It is
+  /// an I/O scheduling hint, independent of encoding, and does not require
+  /// serial completion or host/device synchronization. A provider documents
+  /// its scheduling domain; a hit that submits no I/O needs no serialization.
   virtual DeviceReadBatch readDeviceRangesAsync(
       std::span<const DeviceByteRange> ranges,
       bool serializeSubmissions,

@@ -66,3 +66,12 @@ These are focused interface tests. A production GPU cache, eviction policy,
 full-query throughput and host-cache streaming performance require separate
 integration measurements. Reusing the same copy algorithm alone does not prove
 that the extra host-side ownership and descriptor work has no performance cost.
+
+Submission scheduling
+---------------------
+
+``serializeSubmissions`` is a format-independent scheduling hint: keep one
+batch's submissions contiguous relative to other callers in the provider's
+scheduling domain. It does not serialize completion or synchronize the GPU.
+Providers document their domain. The cuDF Parquet adapter maps the hint to
+cuDF's cross-caller submission policy; other providers need no cuDF dependency.
