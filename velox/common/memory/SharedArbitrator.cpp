@@ -1186,7 +1186,7 @@ uint64_t SharedArbitrator::reclaimDiscardableCapacity(uint64_t targetBytes) {
         candidate.participant,
         targetBytes - reclaimed,
         maxArbitrationTimeNs_,
-        false);
+        /*localArbitration=*/false);
   }
   return reclaimed;
 }
