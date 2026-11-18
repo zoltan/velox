@@ -40,6 +40,73 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 namespace {
 
+// Reuse completion events from one submitting thread. Completed uploads can
+// return them from the retirement thread; owners keep the pool alive after the
+// IO thread exits. Limit retained handles independently of outstanding reads.
+class UploadEvents {
+ public:
+  explicit UploadEvents(int device) : device_(device) {
+    events_.reserve(kMaxIdle);
+  }
+
+  ~UploadEvents() {
+    int previous;
+    if (cudaGetDevice(&previous) != cudaSuccess ||
+        cudaSetDevice(device_) != cudaSuccess) {
+      return;
+    }
+    for (auto event : events_) {
+      cudaEventDestroy(event);
+    }
+    cudaSetDevice(previous);
+  }
+
+  int device() const {
+    return device_;
+  }
+
+  cudaEvent_t acquire() {
+    {
+      std::lock_guard lock(mutex_);
+      if (!events_.empty()) {
+        auto event = events_.back();
+        events_.pop_back();
+        return event;
+      }
+    }
+    cudaEvent_t event;
+    CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    return event;
+  }
+
+  void release(cudaEvent_t event) noexcept {
+    {
+      std::lock_guard lock(mutex_);
+      if (events_.size() < kMaxIdle) {
+        events_.push_back(event);
+        return;
+      }
+    }
+    cudaEventDestroy(event);
+  }
+
+ private:
+  static constexpr size_t kMaxIdle = 64;
+  const int device_;
+  std::mutex mutex_;
+  std::vector<cudaEvent_t> events_;
+};
+
+std::shared_ptr<UploadEvents> uploadEvents() {
+  static thread_local std::shared_ptr<UploadEvents> events;
+  int device;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  if (!events || events->device() != device) {
+    events = std::make_shared<UploadEvents>(device);
+  }
+  return events;
+}
+
 // Retains a host allocation until the copies using it complete. Error paths
 // drain synchronously; the normal path hands ownership to UploadRetirement.
 class HostUpload {
@@ -49,7 +116,8 @@ class HostUpload {
       cuda::stream_ref stream)
       : buffer_(std::move(buffer)), stream_(stream) {
     ensureCudaContextForThread();
-    CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming));
+    events_ = uploadEvents();
+    event_ = events_->acquire();
   }
 
   ~HostUpload() noexcept {
@@ -58,7 +126,9 @@ class HostUpload {
       const auto status = complete_ ? cudaSuccess
           : recorded_               ? cudaEventSynchronize(event_)
                                     : cudaStreamSynchronize(stream_.get());
-      if (status != cudaSuccess) {
+      if (status == cudaSuccess && recorded_) {
+        events_->release(std::exchange(event_, nullptr));
+      } else if (status != cudaSuccess) {
         LOG(ERROR) << "Cannot retire input upload: "
                    << cudaGetErrorString(status);
         // A failed context cannot establish safe DMA completion.
@@ -67,7 +137,9 @@ class HostUpload {
     } catch (...) {
       buffer_.release();
     }
-    cudaEventDestroy(event_);
+    if (event_) {
+      cudaEventDestroy(event_);
+    }
   }
 
   const cudf::io::datasource::buffer& buffer() const {
@@ -89,6 +161,7 @@ class HostUpload {
  private:
   std::unique_ptr<cudf::io::datasource::buffer> buffer_;
   cuda::stream_ref stream_;
+  std::shared_ptr<UploadEvents> events_;
   cudaEvent_t event_{};
   bool recorded_{false};
   bool complete_{false};

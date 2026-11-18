@@ -88,6 +88,9 @@ a dedicated polling thread. Neither the driver nor an IO worker waits for normal
 upload retirement. The poller checks all pending events, so an incomplete stream
 does not prevent observing completion on another stream. Buffer destruction runs
 outside the queue lock and outside CUDA callbacks; destructors may call CUDA.
+Completed events return to the submitting thread's pool, which retains at most
+64 idle handles. In-flight uploads keep that pool alive after its thread exits.
+An event is reused only after completion has been established.
 
 Host allocations must remain valid until copy completion whether their memory is
 pageable or pinned. This contract also supports readers that retain pinned cache
