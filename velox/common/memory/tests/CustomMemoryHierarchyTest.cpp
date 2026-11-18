@@ -79,7 +79,7 @@ std::unique_ptr<MemoryReclaimer> makeExecutionReclaimer(
   }
   if (const auto* task = std::get_if<TaskReclaimerContext>(&context)) {
     return exec::Task::MemoryReclaimer::create(
-        task->task, task->priority, std::string(task->resourceTag));
+        task->task.lock(), task->priority, std::string(task->resourceTag));
   }
   return exec::MemoryReclaimer::create();
 }
@@ -208,7 +208,7 @@ TEST_F(CustomMemoryHierarchyTest, taskPoolUsesTaskContextReclaimer) {
         auto reclaimer = makeExecutionReclaimer(context);
         if (const auto* taskContext =
                 std::get_if<TaskReclaimerContext>(&context)) {
-          contextTask = taskContext->task.get();
+          contextTask = taskContext->task.lock().get();
           EXPECT_EQ(taskContext->priority, kPriority);
           EXPECT_EQ(taskContext->resourceTag, "device");
           taskReclaimer = reclaimer.get();
@@ -653,6 +653,32 @@ TEST_F(CustomMemoryHierarchyTest, overlappingQueryReclaimsWakeAfterLastExit) {
       }()),
       ::testing::ExitedWithCode(0),
       "");
+}
+
+// A factory may save its context. That must not retain the task which owns
+// the resulting pool/reclaimer hierarchy.
+TEST_F(CustomMemoryHierarchyTest, savedTaskContextDoesNotOwnTask) {
+  std::optional<TaskReclaimerContext> saved;
+  auto query = buildQueryCtx(
+      {"device"}, "saved-context", [&](const ReclaimerContext& context) {
+        if (const auto* task = std::get_if<TaskReclaimerContext>(&context)) {
+          saved = *task;
+        }
+        return makeExecutionReclaimer(context);
+      });
+  // Construct directly: makeTask() also retains tasks in the fixture.
+  auto task = exec::Task::create(
+      "saved-context",
+      makePlan(),
+      0,
+      query,
+      exec::Task::ExecutionMode::kSerial);
+  std::weak_ptr<exec::Task> observer = task;
+  ASSERT_TRUE(saved.has_value());
+  task->requestCancel();
+  task.reset();
+  EXPECT_TRUE(observer.expired());
+  saved.reset();
 }
 
 TEST_F(CustomMemoryHierarchyTest, customHierarchyRespectsParentOptOut) {

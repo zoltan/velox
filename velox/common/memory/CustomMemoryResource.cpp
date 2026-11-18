@@ -51,7 +51,7 @@ std::unique_ptr<MemoryReclaimer> CustomMemoryResource::newReclaimer(
     VELOX_CHECK_NOT_NULL(query->queryCtx);
     VELOX_CHECK_NOT_NULL(query->pool);
   } else if (const auto* task = std::get_if<TaskReclaimerContext>(&context)) {
-    VELOX_CHECK_NOT_NULL(task->task);
+    VELOX_CHECK(!task->task.expired(), "Task reclaimer context has expired");
   }
   return reclaimerFactory_(context);
 }

@@ -51,7 +51,8 @@ struct QueryReclaimerContext {
 };
 
 struct TaskReclaimerContext {
-  std::shared_ptr<exec::Task> task;
+  /// Non-owning: retaining the factory context must not retain its pool owner.
+  std::weak_ptr<exec::Task> task;
   int64_t priority;
   /// Borrowed for the duration of the factory call.
   std::string_view resourceTag;

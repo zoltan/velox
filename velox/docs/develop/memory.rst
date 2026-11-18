@@ -994,7 +994,7 @@ resource's pools:
     if (const auto* task =
             std::get_if<memory::TaskReclaimerContext>(&context)) {
       return exec::Task::MemoryReclaimer::create(
-          task->task, task->priority, std::string(task->resourceTag));
+          task->task.lock(), task->priority, std::string(task->resourceTag));
     }
     return exec::MemoryReclaimer::create();
   }

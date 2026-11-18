@@ -1043,7 +1043,7 @@ bool MemoryPoolImpl::maybeIncrementReservation(uint64_t size) {
     // arbitration process. The memory arbitration process itself needs to
     // ensure the memory pool usage of the memory pool is within the capacity
     // limit after the arbitration operation completes.
-    if (FOLLY_UNLIKELY(reservationBytes_ + size > capacity_)) {
+    if (reservationBytes_ + size > capacity_) [[unlikely]] {
       const auto* context = memoryArbitrationContext();
       if (context == nullptr) {
         return false;
