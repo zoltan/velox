@@ -2629,6 +2629,40 @@ DEBUG_ONLY_TEST_F(TaskTest, findPeerOperators) {
   }
 }
 
+TEST_F(TaskTest, suspendTerminatedDriverForCleanup) {
+  auto plan = PlanBuilder()
+                  .values({makeRowVector({makeFlatVector<int64_t>({1})})})
+                  .planNode();
+  auto task = Task::create(
+      "cleanup-suspension",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver =
+      Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+  auto& state = driver->state();
+  state.isEnqueued = true;
+  ASSERT_EQ(task->enter(state), StopReason::kNone);
+  SCOPE_EXIT {
+    task->leave(state, [](StopReason) {});
+  };
+  task->requestCancel();
+  EXPECT_EQ(task->enterSuspended(state), StopReason::kTerminate);
+  EXPECT_FALSE(state.suspended());
+  {
+    auto pause = task->acquirePause();
+    EXPECT_FALSE(pause.future().isReady());
+    EXPECT_EQ(
+        task->enterSuspended(state, /*allowTerminated=*/true),
+        StopReason::kNone);
+    EXPECT_TRUE(state.suspended());
+    EXPECT_TRUE(pause.future().isReady());
+  }
+  EXPECT_EQ(task->leaveSuspended(state), StopReason::kAlreadyTerminated);
+  EXPECT_FALSE(state.suspended());
+}
+
 class TaskPauseTest : public TaskTest {
  public:
   void testPause() {

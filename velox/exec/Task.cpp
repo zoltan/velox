@@ -4081,7 +4081,7 @@ void Task::leave(
   state.clearThread();
 }
 
-StopReason Task::enterSuspended(ThreadState& state) {
+StopReason Task::enterSuspended(ThreadState& state, bool allowTerminated) {
   VELOX_CHECK(!state.hasBlockingFuture);
   VELOX_CHECK(state.isOnThread());
 
@@ -4093,19 +4093,22 @@ StopReason Task::enterSuspended(ThreadState& state) {
   });
 
   std::lock_guard<std::timed_mutex> l(mutex_);
-  if (state.isTerminated) {
+  if (state.isTerminated && !allowTerminated) {
     return StopReason::kAlreadyTerminated;
   }
   const auto reason = shouldStopLocked();
   if (reason == StopReason::kTerminate) {
     state.isTerminated = true;
-    return StopReason::kTerminate;
+    if (!allowTerminated) {
+      return StopReason::kTerminate;
+    }
   }
   // A pause will not stop entering the suspended section. It will just ack that
   // the thread is no longer inside the driver executor pool.
   VELOX_CHECK(
       reason == StopReason::kNone || reason == StopReason::kPause ||
-          reason == StopReason::kYield,
+          reason == StopReason::kYield ||
+          (allowTerminated && reason == StopReason::kTerminate),
       "Unexpected stop reason on suspension: {}",
       reason);
   if (++state.numSuspensions > 1) {

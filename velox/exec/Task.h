@@ -826,7 +826,12 @@ class Task : public std::enable_shared_from_this<Task> {
   /// is returned. If thread count goes to zero, waiting promises are
   /// realized. If kNone is not returned the calling thread should
   /// unwind and return itself to its pool.
-  StopReason enterSuspended(ThreadState& state);
+  /// allowTerminated is for mandatory cleanup that must drain asynchronous
+  /// work even after termination. It acknowledges pause and returns kNone;
+  /// the caller must pair it with leaveSuspended. Termination remains set:
+  /// callers may handle leaveSuspended's stop reason immediately or observe
+  /// termination at the next normal driver stop check.
+  StopReason enterSuspended(ThreadState& state, bool allowTerminated = false);
 
   StopReason leaveSuspended(ThreadState& state);
 
