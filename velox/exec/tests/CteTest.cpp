@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <gmock/gmock.h>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <latch>
 #include <limits>
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -119,6 +121,106 @@ class CteTest : public HiveConnectorTestBase {
     return count;
   }
 };
+
+// Queue-focused manual benchmark. Each logical reader must claim every unique
+// batch exactly once. Construction and verification are outside the timer.
+TEST_F(CteTest, DISABLED_smallBatchContention) {
+  constexpr int kBatches = 32768;
+  constexpr int kRows = 256;
+  std::vector<RowVectorPtr> batches;
+  for (int batch = 0; batch < kBatches; ++batch) {
+    batches.push_back(makeRowVector({makeFlatVector<int64_t>(
+        kRows, [batch](auto row) { return int64_t(batch) * kRows + row; })}));
+  }
+  for (int drivers : {1, 8, 16, 64}) {
+    for (int readers : {2, 3}) {
+      auto buffer = makeBuffer(readers, {}, drivers, drivers);
+      std::promise<void> start;
+      auto gate = start.get_future().share();
+      std::latch ready(drivers * (readers + 1));
+      std::vector<std::future<void>> producers;
+      std::vector<std::future<std::vector<int>>> consumers;
+      for (int driver = 0; driver < drivers; ++driver) {
+        producers.push_back(std::async(std::launch::async, [&, driver] {
+          ready.count_down();
+          gate.wait();
+          try {
+            for (int batch = driver; batch < kBatches; batch += drivers) {
+              buffer->add(batches[batch]);
+            }
+            buffer->finish();
+          } catch (...) {
+            buffer->cancel();
+            throw;
+          }
+        }));
+      }
+      for (int reader = 0; reader < readers; ++reader) {
+        for (int driver = 0; driver < drivers; ++driver) {
+          consumers.push_back(std::async(std::launch::async, [&, reader] {
+            std::vector<int> claims(kBatches, 0);
+            ready.count_down();
+            gate.wait();
+            try {
+              for (;;) {
+                auto batch = buffer->next(reader, pool());
+                if (batch) {
+                  const auto* values =
+                      batch->childAt(0)->asFlatVector<int64_t>();
+                  const auto identity = values->valueAt(0) / kRows;
+                  VELOX_CHECK_GE(identity, 0);
+                  VELOX_CHECK_LT(identity, kBatches);
+                  VELOX_CHECK_EQ(batch->size(), kRows);
+                  VELOX_CHECK_EQ(
+                      values->valueAt(kRows - 1), identity * kRows + kRows - 1);
+                  ++claims[identity];
+                } else if (buffer->atEnd(reader)) {
+                  break;
+                } else {
+                  ContinueFuture future;
+                  if (buffer->readerBlocked(reader, &future)) {
+                    std::move(future).get();
+                  }
+                }
+              }
+              buffer->closeReader(reader);
+              return claims;
+            } catch (...) {
+              buffer->cancel();
+              throw;
+            }
+          }));
+        }
+      }
+      ready.wait();
+      const auto begin = std::chrono::steady_clock::now();
+      start.set_value();
+      for (auto& producer : producers) {
+        producer.get();
+      }
+      for (auto& consumer : consumers) {
+        consumer.wait();
+      }
+      const auto seconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - begin)
+                               .count();
+      for (int reader = 0; reader < readers; ++reader) {
+        std::vector<int> claims(kBatches, 0);
+        for (int driver = 0; driver < drivers; ++driver) {
+          const auto partial = consumers[reader * drivers + driver].get();
+          for (int batch = 0; batch < kBatches; ++batch) {
+            claims[batch] += partial[batch];
+          }
+        }
+        EXPECT_THAT(claims, testing::Each(1));
+      }
+      EXPECT_TRUE(buffer->allReadersClosed());
+      std::cout << "CTE_SMALL drivers=" << drivers << " readers=" << readers
+                << " batches=" << kBatches << " rows=" << kRows
+                << " seconds=" << seconds << std::endl;
+    }
+  }
+}
 
 TEST_F(CteTest, concurrentPolling) {
   const int iterations = std::getenv("VELOX_CTE_POLL_ITERATIONS")
