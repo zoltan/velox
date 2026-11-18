@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfGroupId.h"
+#include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -154,16 +155,131 @@ TEST_F(CudfCteTest, sharedProjectionDoesNotCopyUnusedColumns) {
       pool(),
       expected->type(),
       stream,
-      cudf::get_current_device_resource_ref());
+      get_output_mr());
   facebook::velox::test::assertEqualVectors(expected, actual);
   auto unchanged = with_arrow::toVeloxColumn(
-      original->getTableView(),
-      pool(),
-      host->type(),
-      stream,
-      cudf::get_current_device_resource_ref());
+      original->getTableView(), pool(), host->type(), stream, get_output_mr());
   facebook::velox::test::assertEqualVectors(host, unchanged);
   op.close();
+}
+
+TEST_F(CudfCteTest, narrowSharedProjectionDoesNotRetainWideJoinBuildInput) {
+  constexpr vector_size_t kRows = 1 << 16;
+  constexpr int kBatches = 16;
+  std::vector<VectorPtr> columns;
+  for (int i = 0; i < 20; ++i) {
+    columns.push_back(
+        makeFlatVector<int64_t>(kRows, [](auto row) { return row; }));
+  }
+  auto host = makeRowVector(columns);
+  auto ids = std::make_shared<core::PlanNodeIdGenerator>();
+  auto projected =
+      PlanBuilder(ids).values({host}).project({"c0", "c1"}).planNode();
+  auto probe = makeRowVector({"p"}, {columns[0]});
+  auto plan = PlanBuilder(ids)
+                  .values({probe})
+                  .hashJoin({"p"}, {"c0"}, projected, "", {"p"})
+                  .planNode();
+  auto task = Task::create(
+      "retained-projection",
+      core::PlanFragment{plan},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver =
+      Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+  CudfFilterProject project(
+      0,
+      driver->driverCtx(),
+      nullptr,
+      std::dynamic_pointer_cast<const core::ProjectNode>(projected));
+  CudfHashJoinBuild build(
+      1,
+      driver->driverCtx(),
+      std::dynamic_pointer_cast<const core::HashJoinNode>(plan));
+  project.initialize();
+  build.initialize();
+  cuda::stream stream{cuda::device_ref{0}};
+  ASSERT_FALSE(outputStatsMr_);
+  const auto baseline = cudfAllocatedBytes();
+  statsMr_->push_counters();
+  uint64_t wideBytes = 0;
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < kBatches; ++i) {
+    auto table = with_arrow::toCudfTable(host, pool(), stream, get_output_mr());
+    auto original = std::make_shared<CudfVector>(
+        pool(), host->type(), kRows, std::move(table), stream);
+    wideBytes = original->estimateFlatSize();
+    project.addInput(original->shareForRead(pool()));
+    original.reset();
+    build.addInput(project.getOutput());
+    CUDF_CUDA_TRY(cudaDeviceSynchronize());
+  }
+  const auto retained = cudfAllocatedBytes() - baseline;
+  const auto counters = statsMr_->pop_counters().first;
+  const auto elapsed = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  std::cout << "NARROW_JOIN_BUILD batches=" << kBatches << " rows=" << kRows
+            << " wide_batch_bytes=" << wideBytes
+            << " retained_bytes=" << retained
+            << " peak_extra_bytes=" << counters.peak
+            << " elapsed_ms=" << elapsed << std::endl;
+  // Two of twenty columns remain; allow padding without retaining all twenty.
+  EXPECT_LT(retained, wideBytes * kBatches / 4);
+  project.close();
+  build.close();
+  CUDF_CUDA_TRY(cudaDeviceSynchronize());
+  EXPECT_EQ(cudfAllocatedBytes(), baseline);
+}
+
+TEST_F(CudfCteTest, bufferingPreservesWholeBatchSharing) {
+  auto host = makeRowVector(
+      {makeNullableFlatVector<int64_t>({1, std::nullopt, 3}),
+       makeFlatVector<int64_t>({10, 20, 30})});
+  cuda::stream stream{cuda::device_ref{0}};
+  auto original = std::make_shared<CudfVector>(
+      pool(),
+      host->type(),
+      host->size(),
+      with_arrow::toCudfTable(host, pool(), stream, get_output_mr()),
+      stream);
+  auto shared =
+      std::dynamic_pointer_cast<CudfVector>(original->shareForRead(pool()));
+  EXPECT_EQ(CudfVector::forBuffering(shared, get_output_mr()), shared);
+  auto reordered = CudfVector::withSharedColumns(
+      shared,
+      ROW({"b", "a"}, {BIGINT(), BIGINT()}),
+      std::vector<std::unique_ptr<cudf::column>>(2),
+      {1, 0});
+  EXPECT_EQ(CudfVector::forBuffering(reordered, get_output_mr()), reordered);
+  auto narrow = CudfVector::withSharedColumns(
+      shared,
+      ROW({"a"}, {BIGINT()}),
+      std::vector<std::unique_ptr<cudf::column>>(1),
+      {0});
+  // Republish and project a composite: the omitted ancestor remains omitted.
+  auto snapshot =
+      std::dynamic_pointer_cast<CudfVector>(narrow->shareForRead(pool()));
+  auto chained = CudfVector::withSharedColumns(
+      snapshot,
+      snapshot->type(),
+      std::vector<std::unique_ptr<cudf::column>>(1),
+      {0});
+  auto compact = CudfVector::forBuffering(chained, get_output_mr());
+  EXPECT_FALSE(compact->isShared());
+  EXPECT_NE(
+      compact->getTableView().column(0).head<int64_t>(),
+      shared->getTableView().column(0).head<int64_t>());
+  auto actual = with_arrow::toVeloxColumn(
+      compact->getTableView(),
+      pool(),
+      compact->type(),
+      stream,
+      get_output_mr());
+  facebook::velox::test::assertEqualVectors(
+      makeRowVector({host->childAt(0)}), actual);
+  EXPECT_EQ(CudfVector::forBuffering(compact, get_output_mr()), compact);
 }
 
 TEST_F(CudfCteTest, sharedFilterAndProjectionPreserveInput) {
@@ -437,8 +553,7 @@ TEST_F(CudfCteTest, readerReleaseDoesNotBlockProducerStream) {
   cuda::stream producer{cuda::device_ref{0}};
   cuda::stream consumer{cuda::device_ref{0}};
   auto host = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
-  auto table = with_arrow::toCudfTable(
-      host, pool(), producer, cudf::get_current_device_resource_ref());
+  auto table = with_arrow::toCudfTable(host, pool(), producer, get_output_mr());
   auto original = std::make_shared<CudfVector>(
       pool(), host->type(), host->size(), std::move(table), producer);
   auto reader =
@@ -621,8 +736,7 @@ TEST_F(CudfCteTest, cpuProducerWithCpuReadersStaysOnHost) {
 TEST_F(CudfCteTest, zeroCopyBuffer) {
   cuda::stream stream{cuda::device_ref{0}};
   auto host = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
-  auto table = with_arrow::toCudfTable(
-      host, pool(), stream, cudf::get_current_device_resource_ref());
+  auto table = with_arrow::toCudfTable(host, pool(), stream, get_output_mr());
   auto input = std::make_shared<CudfVector>(
       pool(), host->type(), host->size(), std::move(table), stream);
   const auto* address = input->getTableView().column(0).head<int64_t>();
@@ -652,11 +766,7 @@ TEST_F(CudfCteTest, zeroCopyBuffer) {
   EXPECT_NE(owned->view().column(0).head<int64_t>(), address);
   EXPECT_EQ(second->getTableView().column(0).head<int64_t>(), address);
   auto result = with_arrow::toVeloxColumn(
-      second->getTableView(),
-      pool(),
-      host->type(),
-      stream,
-      cudf::get_current_device_resource_ref());
+      second->getTableView(), pool(), host->type(), stream, get_output_mr());
   facebook::velox::test::assertEqualVectors(host, result);
 }
 
@@ -735,11 +845,7 @@ TEST_F(CudfCteTest, packedAndNestedStorage) {
     input.reset();
     EXPECT_EQ(resource.get_bytes_counter().value, liveBytes);
     auto result = with_arrow::toVeloxColumn(
-        first->getTableView(),
-        pool(),
-        host->type(),
-        stream,
-        cudf::get_current_device_resource_ref());
+        first->getTableView(), pool(), host->type(), stream, get_output_mr());
     facebook::velox::test::assertEqualVectors(host, result);
     first.reset();
     stream.sync();
@@ -765,7 +871,10 @@ TEST_F(CudfCteTest, asynchronousReaders) {
           rows,
           std::move(data),
           cudf::create_null_mask(
-              0, cudf::mask_state::UNALLOCATED, producer, memory),
+              0,
+              cudf::mask_state::UNALLOCATED,
+              producer,
+              cudf::memory_resources{memory, memory}),
           0));
   auto input = std::make_shared<CudfVector>(
       pool(),
@@ -830,8 +939,7 @@ TEST_F(CudfCteTest, retainedByteLimit) {
   cuda::stream stream{cuda::device_ref{0}};
   auto host = makeRowVector(
       {makeFlatVector<int64_t>(1024, [](auto row) { return row; })});
-  auto table = with_arrow::toCudfTable(
-      host, pool(), stream, cudf::get_current_device_resource_ref());
+  auto table = with_arrow::toCudfTable(host, pool(), stream, get_output_mr());
   auto input = std::make_shared<CudfVector>(
       pool(), host->type(), host->size(), std::move(table), stream);
   auto buffer = std::make_shared<exec::detail::SharedResultBuffer>(
@@ -1062,11 +1170,7 @@ TEST_F(CudfCteTest, cancellationRetainsClaimedStorage) {
   EXPECT_EQ(resource.get_bytes_counter().value, claimed->retainedSize());
   ASSERT_TRUE(claimed->rebindStream(consumer));
   auto result = with_arrow::toVeloxColumn(
-      claimed->getTableView(),
-      pool(),
-      host->type(),
-      consumer,
-      cudf::get_current_device_resource_ref());
+      claimed->getTableView(), pool(), host->type(), consumer, get_output_mr());
   facebook::velox::test::assertEqualVectors(host, result);
   claimed.reset();
   producer.sync();

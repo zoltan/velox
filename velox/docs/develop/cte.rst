@@ -380,3 +380,24 @@ sample length. It checks device pointer identity and both consumers' results;
 reported live bytes exclude allocator-reserved capacity. The generic queue's
 ``concurrentPolling`` test accepts ``VELOX_CTE_POLL_ITERATIONS`` and exercises
 1, 8, 32 and 64 threads. These are isolated measurements, not query throughput.
+
+Buffering projected device inputs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A shared-column projection retains its parent batch while it streams. Before
+join build, right-semi probe, or sort buffers a projection across batches,
+``CudfVector::forBuffering`` detaches its visible columns if it retains omitted
+ancestor columns. Complete shared batches, reordered complete projections, and
+exclusive inputs remain zero-copy. This is an ownership rule, independent of
+query names and data values. Other readers still retain their own parent views.
+
+The regression test buffers sixteen batches of 65,536 rows, each projecting two
+INT64 columns from twenty. On an RTX PRO 6000, tracked retained device bytes fell
+from 170,393,600 to 17,039,360 and peak bytes from 170,401,820 to 27,688,960.
+Warmed buffering-phase time increased from about 18.9 to 20.4 ms because the
+visible columns are copied; this is a memory fix, not a join-throughput claim.
+The test includes upload, projection, buffering, and a device sync per batch;
+it excludes hash-table construction. It asserts return to the allocation
+baseline after close. A separate test covers nulls, ancestor retention, and
+pointer-preserving whole-batch buffering. If another reader still needs the
+wide parent, compaction can temporarily add a narrow allocation alongside it.

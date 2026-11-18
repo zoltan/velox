@@ -91,7 +91,8 @@ void CudfOrderBy::doAddInput(RowVectorPtr input) {
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
-    inputs_.push_back(std::move(cudfInput));
+    inputs_.push_back(
+        CudfVector::forBuffering(std::move(cudfInput), get_output_mr()));
   }
 }
 

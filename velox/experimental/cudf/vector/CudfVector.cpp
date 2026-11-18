@@ -212,6 +212,7 @@ RowVectorPtr CudfVector::shareForRead(memory::MemoryPool* pool) {
   }
   auto snapshot = std::shared_ptr<CudfVector>(new CudfVector(
       pool, type(), size(), sharedStorage_, tabView_, flatSize_, stream_));
+  snapshot->retainsUnusedColumns_ = retainsUnusedColumns_;
   return snapshot;
 }
 
@@ -229,6 +230,7 @@ std::shared_ptr<CudfVector> CudfVector::withSharedColumns(
   views.reserve(columns.size());
   owned.reserve(columns.size());
   uint64_t bytes = 0;
+  std::vector<bool> referenced(inputView.num_columns(), false);
   for (size_t i = 0; i < columns.size(); ++i) {
     if (columns[i]) {
       VELOX_CHECK_EQ(columns[i]->size(), input->size());
@@ -236,7 +238,9 @@ std::shared_ptr<CudfVector> CudfVector::withSharedColumns(
       views.push_back(columns[i]->view());
       owned.push_back(std::move(columns[i]));
     } else {
+      VELOX_CHECK_GE(inputChannels[i], 0);
       VELOX_CHECK_LT(inputChannels[i], inputView.num_columns());
+      referenced[inputChannels[i]] = true;
       views.push_back(inputView.column(inputChannels[i]));
     }
   }
@@ -258,7 +262,7 @@ std::shared_ptr<CudfVector> CudfVector::withSharedColumns(
   rebindTable(table, storage->stream());
   storage->table = std::move(table);
   storage->parent = input->sharedStorage_;
-  return std::shared_ptr<CudfVector>(new CudfVector(
+  auto output = std::shared_ptr<CudfVector>(new CudfVector(
       input->pool(),
       std::move(outputType),
       input->size(),
@@ -266,6 +270,24 @@ std::shared_ptr<CudfVector> CudfVector::withSharedColumns(
       cudf::table_view{views},
       bytes,
       input->stream_));
+  output->retainsUnusedColumns_ = input->retainsUnusedColumns_ ||
+      std::find(referenced.begin(), referenced.end(), false) !=
+          referenced.end();
+  return output;
+}
+
+std::shared_ptr<CudfVector> CudfVector::forBuffering(
+    std::shared_ptr<CudfVector> input,
+    rmm::device_async_resource_ref destination) {
+  if (!input->retainsUnusedColumns_) {
+    return input;
+  }
+  return std::make_shared<CudfVector>(
+      input->pool(),
+      input->type(),
+      input->size(),
+      input->release(destination),
+      input->stream());
 }
 
 CudfVector::CudfVector(

@@ -599,7 +599,8 @@ void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
   if (joinNode_->isRightSemiFilterJoin()) {
     // Queue inputs and process all at once
     if (input->size() > 0) {
-      inputs_.push_back(std::move(cudfInput));
+      inputs_.push_back(
+          CudfVector::forBuffering(std::move(cudfInput), get_output_mr()));
     }
     return;
   }

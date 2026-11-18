@@ -84,6 +84,13 @@ class CudfVector : public RowVector, public SharedVector {
       std::vector<std::unique_ptr<cudf::column>> columns,
       const std::vector<column_index_t>& inputChannels);
 
+  /// Detach a projected shared input before retaining it across batches. Whole
+  /// shared batches remain zero-copy; omitted parent columns must not remain
+  /// live merely because a buffering consumer keeps this projection.
+  static std::shared_ptr<CudfVector> forBuffering(
+      std::shared_ptr<CudfVector> input,
+      rmm::device_async_resource_ref destination);
+
   bool isShared() const {
     return sharedStorage_ != nullptr;
   }
@@ -150,6 +157,7 @@ class CudfVector : public RowVector, public SharedVector {
 
   cuda::stream_ref stream_;
   uint64_t flatSize_;
+  bool retainsUnusedColumns_{false};
 };
 
 using CudfVectorPtr = std::shared_ptr<CudfVector>;
