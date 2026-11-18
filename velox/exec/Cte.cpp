@@ -427,7 +427,8 @@ core::PlanNodePtr finalizeCtes(
       const auto& cte = scan->definition();
       VELOX_USER_CHECK_NOT_NULL(
           cte, "Deserialized CTE plans are already finalized");
-      auto [it, inserted] = definitions.try_emplace(cte->id, Definition{cte});
+      auto [it, inserted] = definitions.try_emplace(
+          cte->id, Definition{.cte = cte, .readers = {}, .visiting = true});
       auto& definition = it->second;
       VELOX_USER_CHECK(
           definition.cte == cte,
