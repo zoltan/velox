@@ -40,6 +40,39 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 namespace {
 
+// Retain and account OSS staging without changing its allocation strategy.
+// External host_read implementations can return already-accounted pins
+// unchanged.
+class HostReadBuffer final : public cudf::io::datasource::buffer {
+ public:
+  HostReadBuffer(size_t size, memory::MemoryPool* pool)
+      : pool_(pool->shared_from_this()), buffer_(size) {
+    pool_->reportExternalAllocation(buffer_.capacity());
+  }
+
+  ~HostReadBuffer() override {
+    const auto bytes = buffer_.capacity();
+    std::vector<uint8_t>().swap(buffer_);
+    pool_->reportExternalFree(bytes);
+  }
+
+  const uint8_t* data() const override {
+    return buffer_.data();
+  }
+
+  uint8_t* mutableData() {
+    return buffer_.data();
+  }
+
+  size_t size() const override {
+    return buffer_.size();
+  }
+
+ private:
+  std::shared_ptr<memory::MemoryPool> pool_;
+  std::vector<uint8_t> buffer_;
+};
+
 // Reuse completion events from one submitting thread. Completed uploads can
 // return them from the retirement thread; owners keep the pool alive after the
 // IO thread exits. Limit retained handles independently of outstanding reads.
@@ -337,9 +370,9 @@ BufferedInputDataSource::host_read(size_t offset, size_t size) {
     return cudf::io::datasource::buffer::create(std::vector<uint8_t>{});
   }
   const size_t readSize = std::min(size, fileSize_ - offset);
-  std::vector<uint8_t> data(readSize);
-  readContiguous(offset, readSize, data.data());
-  return cudf::io::datasource::buffer::create(std::move(data));
+  auto buffer = std::make_unique<HostReadBuffer>(readSize, input_->pool());
+  readContiguous(offset, readSize, buffer->mutableData());
+  return buffer;
 }
 
 size_t

@@ -108,6 +108,12 @@ class BufferedInput {
     return input_->getName();
   }
 
+  /// Memory pool used for input buffers. Consumers retaining buffers past the
+  /// reader lifetime must also retain this pool.
+  memory::MemoryPool* pool() const {
+    return pool_;
+  }
+
   /// The previous API was taking a vector of regions. Now we allow callers to
   /// enqueue region any time/place and we do final load into buffer in 2 steps
   /// (enqueue....load). 'si' allows tracking which streams actually get read.

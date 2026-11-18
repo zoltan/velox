@@ -135,3 +135,19 @@ only releases its device allocation; the existing BufferedInput path reconstruct
 it from host cache or storage. The cache does not implement operator spilling.
 The memory library depends on `velox_exec` for driver suspension hooks; it sits
 below cuDF readers and operators, not below all of Velox execution.
+
+### Host upload storage
+
+The OSS datasource accounts contiguous staging buffers through BufferedInput's
+external-allocation API and retains that pool with each buffer. The existing
+vector allocation path is preserved. Both pinned buffers supplied
+by another datasource and these pageable buffers remain alive until the recorded
+copy event completes. CUDA's asynchronous pageable-copy contract does not promise
+source completion at API return. This is independent of GPU input caching.
+Already-accounted host cache pins returned by an override incur no second charge.
+
+CUDA 12.8 introduces `cudaMemcpyBatchAsync` with
+`cudaMemcpySrcAccessOrderDuringApiCall`; its signature changes in CUDA 13. An
+RTX PRO 6000/CUDA 13 experiment found explicit source completion slower for
+1 MiB and 16 MiB transfers, so the production path retains event-based completion.
+This also preserves asynchronous copies from internal pinned host caches.

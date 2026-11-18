@@ -523,6 +523,24 @@ class RecordingInputSource : public connector::hive::BufferedInputDataSource {
   }
 };
 
+TEST_F(GpuInputCacheTest, hostStagingIsAccountedUntilBufferRelease) {
+  auto root = memory::memoryManager()->addRootPool("staging-test");
+  auto pool = root->addLeafChild("staging");
+  auto input = std::make_shared<CacheableInput>(
+      std::make_shared<InMemoryReadFile>(std::string(8192, 'x')), *pool, false);
+  auto source = std::make_shared<RecordingInputSource>(input);
+  const auto baseline = pool->usedBytes();
+  auto buffer = source->host_read(0, 8192);
+  EXPECT_GE(pool->usedBytes(), baseline + 8192);
+  EXPECT_EQ(buffer->size(), 8192);
+  EXPECT_EQ(buffer->data()[8191], 'x');
+  source.reset();
+  input.reset();
+  EXPECT_GE(pool->usedBytes(), baseline + 8192);
+  buffer.reset();
+  EXPECT_EQ(pool->usedBytes(), baseline);
+}
+
 TEST_F(GpuInputCacheTest, coldReadsReturnPendingAndCoalesceMisses) {
   auto resource = createCudfCustomMemoryResource(128L << 20, true);
   auto upstream = createMemoryResource("cuda", 0);
