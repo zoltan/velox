@@ -176,9 +176,14 @@ class HostUpload {
 // destructors may call CUDA (e.g. cudaFreeHost), excluding host callbacks.
 class UploadRetirement {
  public:
-  UploadRetirement() : worker_([this] { run(); }) {}
-
   ~UploadRetirement() {
+    shutdown();
+  }
+
+  void shutdown() {
+    if (!worker_.joinable()) {
+      return;
+    }
     {
       std::lock_guard lock(mutex_);
       stopping_ = true;
@@ -191,6 +196,11 @@ class UploadRetirement {
     bool wake;
     {
       std::lock_guard lock(mutex_);
+      if (!worker_.joinable()) {
+        stopping_ = false;
+        polling_ = false;
+        worker_ = std::thread([this] { run(); });
+      }
       uploads_.push_back(std::move(upload));
       wake = !polling_;
     }
@@ -263,10 +273,14 @@ class UploadRetirement {
   std::thread worker_;
 };
 
+UploadRetirement& uploadRetirement() {
+  static UploadRetirement retirement;
+  return retirement;
+}
+
 void retireUpload(std::unique_ptr<HostUpload> upload) {
   upload->recordCompletion();
-  static UploadRetirement retirement;
-  retirement.add(std::move(upload));
+  uploadRetirement().add(std::move(upload));
 }
 
 // Launches the `read` task on the IO executor or waiting thread, whichever
@@ -289,6 +303,10 @@ std::future<size_t> submitDeviceRead(
 }
 
 } // namespace
+
+void drainInputUploads() {
+  uploadRetirement().shutdown();
+}
 
 BufferedInputDataSource::BufferedInputDataSource(
     std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,

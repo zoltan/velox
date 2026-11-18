@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
@@ -421,6 +422,7 @@ void registerCudf() {
 }
 
 void unregisterCudf() {
+  connector::hive::drainInputUploads();
   resetEncodedInputGpuCache();
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
   // Unconditionally unregister the UCX transports, whether or not

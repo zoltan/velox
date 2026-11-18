@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/exec/EncodedInputGpuCache.h"
 #include "velox/experimental/cudf/exec/GpuEncodedCache.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/io/CachedDeviceRead.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -563,7 +564,7 @@ TEST_F(GpuInputCacheTest, coldReadsReturnPendingAndCoalesceMisses) {
   executor.drain();
 }
 
-void testUploadRetirement(bool cacheEnabled) {
+void testUploadRetirement(bool cacheEnabled, bool unregister = false) {
   class PinnedBuffer final : public cudf::io::datasource::buffer {
    public:
     explicit PinnedBuffer(std::promise<void>& freed) : freed_(freed) {
@@ -628,8 +629,21 @@ void testUploadRetirement(bool cacheEnabled) {
   auto ioFuture = ioProgress.get_future();
   executor.add([&] { ioProgress.set_value(); });
   const auto ioStatus = ioFuture.wait_for(std::chrono::seconds(2));
+  std::future<void> drained;
+  if (unregister) {
+    drained = std::async(std::launch::async, [] { unregisterCudf(); });
+    EXPECT_EQ(
+        drained.wait_for(std::chrono::milliseconds(50)),
+        std::future_status::timeout);
+  }
   unblock.set_value();
   completion.get();
+  if (drained.valid()) {
+    drained.get();
+    EXPECT_EQ(
+        freedFuture.wait_for(std::chrono::seconds(0)),
+        std::future_status::ready);
+  }
   EXPECT_EQ(status, std::future_status::ready);
   executor.join();
   EXPECT_EQ(ioStatus, std::future_status::ready);
@@ -645,6 +659,11 @@ void testUploadRetirement(bool cacheEnabled) {
 
 TEST_F(GpuInputCacheTest, pendingCompletionDoesNotWaitForDevice) {
   testUploadRetirement(true);
+}
+
+TEST_F(GpuInputCacheTest, unregisterDrainsUploadsAndAllowsRestart) {
+  testUploadRetirement(false, true);
+  testUploadRetirement(false);
 }
 
 TEST_F(GpuInputCacheTest, uncachedUploadsDoNotBlockIoExecutor) {

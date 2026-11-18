@@ -32,6 +32,11 @@
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
+/// Drains accepted host uploads before unregistering cuDF resources. Call after
+/// stopping reader submissions; concurrent shutdown/submission is unsupported.
+/// A later read lazily starts a new retirement worker.
+void drainInputUploads();
+
 // A cudf::io::datasource that serves bytes via Velox BufferedInput so that
 // reads benefit from AsyncDataCache / SSD cache and are always returned as
 // contiguous buffers.

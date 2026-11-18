@@ -100,7 +100,10 @@ pageable or pinned. This contract also supports readers that retain pinned cache
 leases; it does not require another staging copy or change the host cache. On
 exceptional handoff failure the owner drains synchronously. If CUDA cannot
 establish completion, cleanup retains the host allocation rather than freeing
-potential DMA input. Process shutdown drains pending retirement work.
+potential DMA input. `unregisterCudf()` drains pending uploads before releasing
+cuDF resources. Reader submissions must already have stopped, as required for
+resource teardown. The worker starts lazily on the next read after registration;
+its static destructor is only a fallback for callers that omit unregister.
 
 The batch drains every accepted read on failure or abandonment. A rejected
 submission discards unpublished destinations after accepted work completes.
