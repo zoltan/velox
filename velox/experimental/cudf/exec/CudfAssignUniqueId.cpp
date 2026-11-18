@@ -19,6 +19,7 @@
 
 #include <cudf/lists/filling.hpp>
 
+#include <numeric>
 #include <utility>
 
 namespace facebook::velox::cudf_velox {
@@ -68,6 +69,16 @@ RowVectorPtr CudfAssignUniqueId::doGetOutput() {
   auto uniqueIdColumn =
       generateIdColumn(input_->size(), stream, get_output_mr());
   auto size = cudfVector->size();
+  if (cudfVector->isShared()) {
+    std::vector<std::unique_ptr<cudf::column>> owned(outputType_->size());
+    owned.back() = std::move(uniqueIdColumn);
+    std::vector<column_index_t> channels(outputType_->size());
+    std::iota(channels.begin(), channels.end(), 0);
+    auto output = CudfVector::withSharedColumns(
+        cudfVector, outputType_, std::move(owned), channels);
+    input_.reset();
+    return output;
+  }
   auto columns = cudfVector->release(get_output_mr())->release();
   columns.push_back(std::move(uniqueIdColumn));
   auto output = std::make_shared<CudfVector>(

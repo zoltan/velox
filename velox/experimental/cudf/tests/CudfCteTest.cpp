@@ -15,10 +15,14 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
+#include "velox/experimental/cudf/exec/CudfGroupId.h"
+#include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -136,7 +140,10 @@ TEST_F(CudfCteTest, sharedProjectionDoesNotCopyUnusedColumns) {
     peak += outputCounters.peak;
   }
   ASSERT_NE(result, nullptr);
-  EXPECT_LT(allocated, iterations * kRows * sizeof(int64_t) * 2);
+  EXPECT_EQ(allocated, 0);
+  EXPECT_EQ(
+      result->getTableView().column(0).head<int64_t>(),
+      original->getTableView().column(0).head<int64_t>());
   std::cout << "SHARED_PROJECT allocated_bytes=" << allocated
             << " peak_bytes=" << peak << " iterations=" << iterations
             << " elapsed_ms=" << elapsed << " input_live_bytes=" << inputBytes
@@ -191,6 +198,171 @@ TEST_F(CudfCteTest, sharedFilterAndProjectionPreserveInput) {
 
 // Device-only allocation/copy/publication/release cycle. The two consumer
 // streams read the shared payload before the next iteration reuses pool space.
+TEST_F(CudfCteTest, computedOnlySharedProjectionOwnsItsOutput) {
+  auto host = makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto plan =
+      PlanBuilder().values({host}).project({"c0 + 7 as added"}).planNode();
+  auto task = Task::create(
+      "computed-only",
+      core::PlanFragment{plan->sources()[0]},
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driver =
+      Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+  CudfFilterProject op(
+      0,
+      driver->driverCtx(),
+      nullptr,
+      std::dynamic_pointer_cast<const core::ProjectNode>(plan));
+  const auto baseline = cudfAllocatedBytes();
+  op.initialize();
+  cuda::stream stream{cuda::device_ref{0}};
+  auto table = with_arrow::toCudfTable(host, pool(), stream, get_output_mr());
+  auto original = std::make_shared<CudfVector>(
+      pool(), host->type(), host->size(), std::move(table), stream);
+  op.addInput(original->shareForRead(pool()));
+  auto output = std::dynamic_pointer_cast<CudfVector>(op.getOutput());
+  ASSERT_NE(output, nullptr);
+  EXPECT_FALSE(output->isShared());
+  original.reset();
+  op.close();
+  CUDF_CUDA_TRY(cudaDeviceSynchronize());
+  EXPECT_EQ(cudfAllocatedBytes(), baseline + output->estimateFlatSize());
+  const auto* pointer = output->getTableView().column(0).head<int64_t>();
+  auto owned = output->release(get_output_mr());
+  EXPECT_EQ(owned->view().column(0).head<int64_t>(), pointer);
+  auto expected = makeRowVector({makeFlatVector<int64_t>({8, 9, 10, 11})});
+  auto actual = with_arrow::toVeloxColumn(
+      owned->view(), pool(), expected->type(), stream, get_output_mr());
+  facebook::velox::test::assertEqualVectors(expected, actual);
+}
+
+TEST_F(CudfCteTest, sharedColumnsSurviveInputAndStreamChange) {
+  constexpr vector_size_t kRows = 512;
+  auto keys = makeFlatVector<int64_t>(kRows, [](auto i) { return i % 16; });
+  auto values = makeFlatVector<int64_t>(
+      kRows, [](auto i) { return i; }, [](auto i) { return i % 7 == 0; });
+  auto host = makeRowVector({keys, values});
+  for (int kind = 0; kind < 4; ++kind) {
+    SCOPED_TRACE(kind);
+    auto builder = PlanBuilder().values({host});
+    if (kind == 0) {
+      builder.project({"c0", "c1", "c0 + 7 as added"});
+    } else if (kind == 1) {
+      builder.assignUniqueId();
+    } else if (kind == 2) {
+      builder.markDistinct("marker", {"c0"});
+    } else {
+      builder.groupId({"c0"}, {{"c0"}, {}}, {"c1"});
+    }
+    auto plan = builder.planNode();
+    auto task = Task::create(
+        "composite",
+        core::PlanFragment{plan->sources()[0]},
+        0,
+        core::QueryCtx::create(driverExecutor_.get()),
+        Task::ExecutionMode::kParallel);
+    auto driver =
+        Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+    std::unique_ptr<Operator> op;
+    if (kind == 0) {
+      op = std::make_unique<CudfFilterProject>(
+          0,
+          driver->driverCtx(),
+          nullptr,
+          std::dynamic_pointer_cast<const core::ProjectNode>(plan));
+    } else if (kind == 1) {
+      op = std::make_unique<CudfAssignUniqueId>(
+          0,
+          driver->driverCtx(),
+          std::dynamic_pointer_cast<const core::AssignUniqueIdNode>(plan),
+          0,
+          std::make_shared<std::atomic_int64_t>(0));
+    } else if (kind == 2) {
+      op = std::make_unique<CudfMarkDistinct>(
+          0,
+          driver->driverCtx(),
+          std::dynamic_pointer_cast<const core::MarkDistinctNode>(plan));
+    } else {
+      op = std::make_unique<CudfGroupId>(
+          0,
+          driver->driverCtx(),
+          std::dynamic_pointer_cast<const core::GroupIdNode>(plan));
+    }
+    op->initialize();
+    cuda::stream producer{cuda::device_ref{0}};
+    cuda::stream consumer{cuda::device_ref{0}};
+    auto table =
+        with_arrow::toCudfTable(host, pool(), producer, get_output_mr());
+    auto original = std::make_shared<CudfVector>(
+        pool(), host->type(), kRows, std::move(table), producer);
+    op->addInput(original->shareForRead(pool()));
+    auto output = std::dynamic_pointer_cast<CudfVector>(op->getOutput());
+    ASSERT_NE(output, nullptr);
+    EXPECT_TRUE(output->isShared());
+    for (int i = 0; i < 2; ++i) {
+      EXPECT_EQ(
+          output->getTableView().column(i).head<int64_t>(),
+          original->getTableView().column(i).head<int64_t>());
+      EXPECT_EQ(
+          output->getTableView().column(i).null_mask(),
+          original->getTableView().column(i).null_mask());
+    }
+    auto reader =
+        std::dynamic_pointer_cast<CudfVector>(output->shareForRead(pool()));
+    CudfVectorPtr second;
+    if (kind == 3) {
+      second = std::dynamic_pointer_cast<CudfVector>(op->getOutput());
+      ASSERT_NE(second, nullptr);
+      EXPECT_EQ(
+          second->getTableView().column(1).head<int64_t>(),
+          original->getTableView().column(1).head<int64_t>());
+      EXPECT_EQ(op->getOutput(), nullptr);
+    }
+    original.reset();
+    output.reset();
+    op->close();
+    EXPECT_TRUE(reader->rebindStream(consumer));
+    std::vector<VectorPtr> expectedColumns{keys, values};
+    if (kind == 2) {
+      expectedColumns.push_back(
+          makeFlatVector<bool>(kRows, [](auto i) { return i < 16; }));
+    } else {
+      expectedColumns.push_back(makeFlatVector<int64_t>(kRows, [kind](auto i) {
+        return kind == 0 ? i % 16 + 7 : kind == 1 ? i : 0;
+      }));
+    }
+    auto expected = makeRowVector(plan->outputType()->names(), expectedColumns);
+    auto actual = with_arrow::toVeloxColumn(
+        reader->getTableView(),
+        pool(),
+        expected->type(),
+        consumer,
+        get_output_mr());
+    facebook::velox::test::assertEqualVectors(expected, actual);
+    if (second) {
+      second->rebindStream(consumer);
+      auto emptyKeys = makeNullConstant(TypeKind::BIGINT, kRows);
+      auto expectedSecond = makeRowVector(
+          plan->outputType()->names(),
+          {emptyKeys, values, makeFlatVector<int64_t>(kRows, [](auto) {
+             return 1;
+           })});
+      auto actualSecond = with_arrow::toVeloxColumn(
+          second->getTableView(),
+          pool(),
+          expectedSecond->type(),
+          consumer,
+          get_output_mr());
+      facebook::velox::test::assertEqualVectors(expectedSecond, actualSecond);
+    }
+    auto exclusive = reader->release(get_output_mr());
+    EXPECT_EQ(exclusive->num_rows(), kRows);
+    consumer.sync();
+  }
+}
+
 TEST_F(CudfCteTest, sharedStorageReuse) {
   constexpr vector_size_t kRows = 1 << 18;
   const int iterations = std::getenv("VELOX_CTE_REUSE_ITERATIONS")

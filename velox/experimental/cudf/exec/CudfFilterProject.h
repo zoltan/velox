@@ -82,7 +82,8 @@ class CudfFilterProject : public CudfOperatorBase {
       const std::vector<cudf::column_view>& inputViews,
       std::vector<std::unique_ptr<cudf::column>>* owned,
       cudf::size_type numRows,
-      cuda::stream_ref stream);
+      cuda::stream_ref stream,
+      std::vector<column_index_t>* sharedChannels = nullptr);
 
   // If true exprs_[0] is a filter and the other expressions are projections
   const bool hasFilter_{false};

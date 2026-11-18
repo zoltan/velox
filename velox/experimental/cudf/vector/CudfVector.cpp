@@ -104,6 +104,7 @@ bool hasStorage(const TableStorage& storage) {
 struct CudfVector::SharedStorage {
   // Destroy the table before the stream on which its buffers are freed.
   std::shared_ptr<rmm::cuda_stream> releaseStream{reclamationStream()};
+  std::shared_ptr<SharedStorage> parent;
   TableStorage table;
   std::atomic<bool> unsafeToFree{false};
   std::mutex mutex;
@@ -128,6 +129,17 @@ struct CudfVector::SharedStorage {
       if (status != cudaSuccess &&
           cudaEventSynchronize(event.get()) != cudaSuccess) {
         unsafeToFree.store(true);
+      }
+    }
+    if (parent) {
+      // The composite is also a reader of its parent. Join only at its final
+      // release, after all consumers of the composite have completed.
+      if (joinStreams(stream(), parent->stream()) != cudaSuccess &&
+          cudaStreamSynchronize(stream().get()) != cudaSuccess) {
+        unsafeToFree.store(true);
+      }
+      if (unsafeToFree.load()) {
+        parent->unsafeToFree.store(true);
       }
     }
     if (unsafeToFree.load()) {
@@ -201,6 +213,59 @@ RowVectorPtr CudfVector::shareForRead(memory::MemoryPool* pool) {
   auto snapshot = std::shared_ptr<CudfVector>(new CudfVector(
       pool, type(), size(), sharedStorage_, tabView_, flatSize_, stream_));
   return snapshot;
+}
+
+std::shared_ptr<CudfVector> CudfVector::withSharedColumns(
+    const std::shared_ptr<CudfVector>& input,
+    TypePtr outputType,
+    std::vector<std::unique_ptr<cudf::column>> columns,
+    const std::vector<column_index_t>& inputChannels) {
+  VELOX_CHECK(input->isShared());
+  VELOX_CHECK_EQ(columns.size(), outputType->size());
+  VELOX_CHECK_EQ(columns.size(), inputChannels.size());
+  const auto inputView = input->getTableView();
+  std::vector<cudf::column_view> views;
+  std::vector<std::unique_ptr<cudf::column>> owned;
+  views.reserve(columns.size());
+  owned.reserve(columns.size());
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < columns.size(); ++i) {
+    if (columns[i]) {
+      VELOX_CHECK_EQ(columns[i]->size(), input->size());
+      bytes += columns[i]->alloc_size();
+      views.push_back(columns[i]->view());
+      owned.push_back(std::move(columns[i]));
+    } else {
+      VELOX_CHECK_LT(inputChannels[i], inputView.num_columns());
+      views.push_back(inputView.column(inputChannels[i]));
+    }
+  }
+  // A computed-only projection owns every column. Preserve exclusive output
+  // ownership so downstream operators can release it without copying, and do
+  // not retain input payloads that the output never references.
+  if (owned.size() == views.size()) {
+    return std::make_shared<CudfVector>(
+        input->pool(),
+        std::move(outputType),
+        input->size(),
+        std::make_unique<cudf::table>(std::move(owned)),
+        input->stream_);
+  }
+  bytes += input->flatSize_;
+  auto storage = std::make_shared<SharedStorage>();
+  auto table = std::make_unique<cudf::table>(std::move(owned));
+  CUDF_CUDA_TRY(joinStreams(input->stream_, storage->stream()));
+  rebindTable(table, storage->stream());
+  storage->table = std::move(table);
+  storage->parent = input->sharedStorage_;
+  return std::shared_ptr<CudfVector>(new CudfVector(
+      input->pool(),
+      std::move(outputType),
+      input->size(),
+      std::move(storage),
+      cudf::table_view{views},
+      bytes,
+      input->stream_));
 }
 
 CudfVector::CudfVector(

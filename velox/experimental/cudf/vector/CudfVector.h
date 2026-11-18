@@ -74,6 +74,16 @@ class CudfVector : public RowVector, public SharedVector {
   /// Final deallocation uses a separate stream, retained by the shared payload.
   RowVectorPtr shareForRead(memory::MemoryPool* pool) override;
 
+  /// Build an immutable output from shared input columns and newly owned
+  /// columns without copying passthroughs. Both vectors have output width;
+  /// each null owned column selects inputChannels[i] from input. Retains the
+  /// complete shared input allocation, including columns not selected.
+  static std::shared_ptr<CudfVector> withSharedColumns(
+      const std::shared_ptr<CudfVector>& input,
+      TypePtr outputType,
+      std::vector<std::unique_ptr<cudf::column>> columns,
+      const std::vector<column_index_t>& inputChannels);
+
   bool isShared() const {
     return sharedStorage_ != nullptr;
   }

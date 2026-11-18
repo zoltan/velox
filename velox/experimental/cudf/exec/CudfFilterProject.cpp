@@ -272,8 +272,17 @@ RowVectorPtr CudfFilterProject::doGetOutput() {
       // An all-true filter can forward the immutable snapshot itself.
       return std::exchange(input_, nullptr);
     } else {
-      outputColumns =
-          project({view.begin(), view.end()}, nullptr, outputSize, stream);
+      std::vector<column_index_t> sharedChannels(outputType_->size());
+      outputColumns = project(
+          {view.begin(), view.end()},
+          nullptr,
+          outputSize,
+          stream,
+          &sharedChannels);
+      auto output = CudfVector::withSharedColumns(
+          cudfInput, outputType_, std::move(outputColumns), sharedChannels);
+      input_.reset();
+      return output;
     }
   } else {
     auto columns = cudfInput->release(get_output_mr())->release();
@@ -360,7 +369,8 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     const std::vector<cudf::column_view>& inputViews,
     std::vector<std::unique_ptr<cudf::column>>* owned,
     cudf::size_type numRows,
-    cuda::stream_ref stream) {
+    cuda::stream_ref stream,
+    std::vector<column_index_t>* sharedChannels) {
   std::vector<ColumnOrView> columns;
   for (auto& projectEvaluator : projectEvaluators_) {
     columns.push_back(
@@ -398,6 +408,10 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
 
   // identityProjections (input to output copy)
   for (auto const& identity : identityProjections_) {
+    if (sharedChannels) {
+      (*sharedChannels)[identity.outputChannel] = identity.inputChannel;
+      continue;
+    }
     if (owned && inputChannelCount[identity.inputChannel] == 1) {
       // Move the column if it occurs only once
       outputColumns[identity.outputChannel] =

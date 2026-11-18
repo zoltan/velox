@@ -28,6 +28,7 @@
 #include <cudf/utilities/error.hpp>
 
 #include <functional>
+#include <numeric>
 
 namespace facebook::velox::cudf_velox {
 
@@ -218,6 +219,16 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
   // Append marker column to output.
   auto pool = cudfInput->pool();
   auto size = cudfInput->size();
+  if (cudfInput->isShared()) {
+    std::vector<std::unique_ptr<cudf::column>> owned(outputType_->size());
+    owned.back() = std::move(markerCol);
+    std::vector<column_index_t> channels(outputType_->size());
+    std::iota(channels.begin(), channels.end(), 0);
+    auto output = CudfVector::withSharedColumns(
+        cudfInput, outputType_, std::move(owned), channels);
+    input_.reset();
+    return output;
+  }
   auto columns = cudfInput->release(get_output_mr())->release();
   columns.push_back(std::move(markerCol));
   cudfInput.reset();

@@ -41,7 +41,7 @@ class CudfGroupId : public CudfOperatorBase {
   }
 
   bool isFinished() override {
-    return noMoreInput_ && inputColumns_.empty();
+    return noMoreInput_ && inputColumns_.empty() && !sharedInput_;
   }
 
  protected:
@@ -66,6 +66,8 @@ class CudfGroupId : public CudfOperatorBase {
   /// Precomputed cudf data types for each grouping key output column, used to
   /// create all-null columns for keys not in a grouping set.
   std::vector<cudf::data_type> groupingKeyCudfTypes_;
+
+  CudfVectorPtr sharedInput_;
 
   /// Stored input columns for cycling through grouping sets.
   std::vector<std::unique_ptr<cudf::column>> inputColumns_;

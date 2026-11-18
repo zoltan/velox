@@ -97,11 +97,13 @@ CudfGroupId::CudfGroupId(
 }
 
 bool CudfGroupId::needsInput() const {
-  return !noMoreInput_ && inputColumns_.empty();
+  return !noMoreInput_ && inputColumns_.empty() && !sharedInput_;
 }
 
 void CudfGroupId::doAddInput(RowVectorPtr input) {
-  VELOX_CHECK(inputColumns_.empty(), "Previous input not fully consumed");
+  VELOX_CHECK(
+      inputColumns_.empty() && !sharedInput_,
+      "Previous input not fully consumed");
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput, "CudfGroupId expects CudfVector input");
@@ -110,13 +112,17 @@ void CudfGroupId::doAddInput(RowVectorPtr input) {
   inputSize_ = static_cast<cudf::size_type>(cudfInput->size());
 
   // Store input columns for cycling through grouping sets
-  auto table = cudfInput->release(get_output_mr());
-  inputColumns_ = table->release();
+  if (cudfInput->isShared()) {
+    sharedInput_ = std::move(cudfInput);
+  } else {
+    auto table = cudfInput->release(get_output_mr());
+    inputColumns_ = table->release();
+  }
   groupingSetIndex_ = 0;
 }
 
 RowVectorPtr CudfGroupId::doGetOutput() {
-  if (inputColumns_.empty()) {
+  if (inputColumns_.empty() && !sharedInput_) {
     return nullptr;
   }
 
@@ -132,6 +138,8 @@ RowVectorPtr CudfGroupId::doGetOutput() {
   const auto& mapping = groupingKeyMappings_[groupingSetIndex_];
   std::vector<std::unique_ptr<cudf::column>> outputColumns(outputType_->size());
 
+  std::vector<column_index_t> sharedChannels(outputType_->size());
+
   // Only move columns on the last grouping set; otherwise copy since
   // inputColumns_ is reused across multiple getOutput() calls.
   const bool isLastGroupingSet = (groupingSetIndex_ == numGroupingSets_ - 1);
@@ -139,7 +147,7 @@ RowVectorPtr CudfGroupId::doGetOutput() {
   // Count occurrences of each input column in the last grouping set.
   // Move columns that occur only once, copy and decrement otherwise.
   std::unordered_map<column_index_t, int> inputColumnUsage;
-  if (isLastGroupingSet) {
+  if (isLastGroupingSet && !sharedInput_) {
     for (size_t i = 0; i < numGroupingKeys_; ++i) {
       if (mapping[i] != kMissingGroupingKey) {
         ++inputColumnUsage[mapping[i]];
@@ -160,6 +168,10 @@ RowVectorPtr CudfGroupId::doGetOutput() {
           cudf::make_column_from_scalar(*nullScalar, numRows, stream, outputMr);
     } else {
       auto inputIdx = mapping[i];
+      if (sharedInput_) {
+        sharedChannels[i] = inputIdx;
+        continue;
+      }
       if (isLastGroupingSet && inputColumnUsage[inputIdx] == 1) {
         outputColumns[i] = std::move(inputColumns_[inputIdx]);
       } else {
@@ -179,12 +191,17 @@ RowVectorPtr CudfGroupId::doGetOutput() {
     auto outputIdx = numGroupingKeys_ + i;
     VELOX_CHECK_LT(
         inputIdx,
-        inputColumns_.size(),
+        sharedInput_ ? sharedInput_->getTableView().num_columns()
+                     : inputColumns_.size(),
         "inputIdx out of bounds in aggregation inputs");
     VELOX_CHECK_LT(
         outputIdx,
         outputColumns.size(),
         "outputIdx out of bounds in aggregation inputs");
+    if (sharedInput_) {
+      sharedChannels[outputIdx] = inputIdx;
+      continue;
+    }
     if (isLastGroupingSet && inputColumnUsage[inputIdx] == 1) {
       outputColumns[outputIdx] = std::move(inputColumns_[inputIdx]);
     } else {
@@ -204,18 +221,26 @@ RowVectorPtr CudfGroupId::doGetOutput() {
       cudf::make_column_from_scalar(groupIdScalar, numRows, stream, outputMr);
 
   // Build output table
-  auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
+  auto output = sharedInput_
+      ? CudfVector::withSharedColumns(
+            sharedInput_, outputType_, std::move(outputColumns), sharedChannels)
+      : std::make_shared<CudfVector>(
+            pool(),
+            outputType_,
+            numRows,
+            std::make_unique<cudf::table>(std::move(outputColumns)),
+            stream);
 
   // Advance to next grouping set
   ++groupingSetIndex_;
   if (groupingSetIndex_ == numGroupingSets_) {
     // All grouping sets processed for this input
     inputColumns_.clear();
+    sharedInput_.reset();
     groupingSetIndex_ = 0;
   }
 
-  return std::make_shared<CudfVector>(
-      pool(), outputType_, numRows, std::move(outputTable), stream);
+  return output;
 }
 
 } // namespace facebook::velox::cudf_velox
